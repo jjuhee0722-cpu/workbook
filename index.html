@@ -143,6 +143,23 @@ async function gistPull() {
   const res = await fetch("https://api.github.com/gists/" + id, {
     headers: { Authorization: "token " + getGistToken(), Accept: "application/vnd.github.v3+json", "Cache-Control": "no-cache", Pragma: "no-cache" }
   });
+  // 저장된 ID가 유효하지 않으면(404) ID 삭제 후 목록에서 재탐색
+  if (res.status === 404) {
+    localStorage.removeItem(GIST_ID_KEY);
+    try {
+      const list = await gistReq("GET", "?per_page=100");
+      const found = list.find(g => g.files?.[GIST_FILE]);
+      if (!found) return null;
+      setGistId(found.id);
+      const res2 = await fetch("https://api.github.com/gists/" + found.id, {
+        headers: { Authorization: "token " + getGistToken(), Accept: "application/vnd.github.v3+json", "Cache-Control": "no-cache" }
+      });
+      if (!res2.ok) throw new Error("HTTP " + res2.status);
+      const g2 = await res2.json();
+      const raw2 = g2.files?.[GIST_FILE]?.content;
+      return raw2 ? JSON.parse(raw2) : null;
+    } catch { return null; }
+  }
   if (!res.ok) throw new Error("HTTP " + res.status);
   const g = await res.json();
   const raw = g.files?.[GIST_FILE]?.content;
@@ -987,14 +1004,18 @@ function App() {
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <span style={{fontSize:11,color:"#aaa"}}>{totalActive}건</span>
-          <button onClick={manualSync} title="지금 동기화"
-            style={{padding:"7px 10px",background:"transparent",border:"1px solid rgba(255,255,255,0.25)",borderRadius:7,fontSize:12,cursor:"pointer",
+          <button
+            onClick={syncStatus==="error"||!getGistToken() ? ()=>setShowSyncSetup(true) : manualSync}
+            title={syncStatus==="error"?"동기화 오류 — 클릭하여 설정 확인":"지금 동기화"}
+            style={{padding:"7px 10px",background:syncStatus==="error"?"rgba(231,76,60,0.2)":"transparent",
+              border:"1px solid "+(syncStatus==="error"?"#e74c3c":"rgba(255,255,255,0.25)"),
+              borderRadius:7,fontSize:12,cursor:"pointer",
               color:syncStatus==="error"?"#e74c3c":syncStatus==="syncing"?"#f1c40f":"#2ecc71",
               display:"flex",alignItems:"center",gap:4}}>
             <span style={{display:"inline-block",animation:syncStatus==="syncing"?"spin 1s linear infinite":"none"}}>
-              {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":"☁"}
+              {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":syncStatus==="error"?"⚠":"☁"}
             </span>
-            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":"동기화"}</span>
+            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류 (설정)":"동기화"}</span>
           </button>
           <button onClick={()=>exportXLSX(entries,cats,contacts)} style={{padding:"7px 10px",background:"#27ae60",color:"#fff",border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer"}}>📊 엑셀</button>
           <button onClick={openNew} style={{padding:"7px 12px",background:"#e74c3c",color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
