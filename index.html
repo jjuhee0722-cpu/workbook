@@ -139,7 +139,12 @@ async function gistPull() {
     } catch { return null; }
   }
   if (!id) return null;
-  const g = await gistReq("GET", "/" + id);
+  // 브라우저 캐시 방지: Cache-Control: no-cache 헤더 직접 전송
+  const res = await fetch("https://api.github.com/gists/" + id, {
+    headers: { Authorization: "token " + getGistToken(), Accept: "application/vnd.github.v3+json", "Cache-Control": "no-cache", Pragma: "no-cache" }
+  });
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const g = await res.json();
   const raw = g.files?.[GIST_FILE]?.content;
   if (!raw) return null;
   return JSON.parse(raw);
@@ -788,28 +793,68 @@ function App() {
   useEffect(()=>{ if(!dbReady) return; idbSetMeta("cats",cats); },[cats,dbReady]);
   useEffect(()=>{ if(!dbReady) return; (async()=>{ await idbClear(STORES.contacts); for(const c of contacts) await idbPut(STORES.contacts,c); })(); },[contacts,dbReady]);
 
-  // ── 앱 시작 시 Gist에서 최신 데이터 Pull ────────────
+  // ── 최신 state를 ref로 유지 (stale closure 방지) ───────
+  const dataRef = useRef({ entries, cats, contacts });
+  useEffect(()=>{ dataRef.current = { entries, cats, contacts }; });
+
+  // ── Pull + 항목별 병합 함수 ──────────────────────────
+  const pullAndMerge = useCallback(async () => {
+    if(!getGistToken()) return false;
+    setSyncStatus("syncing");
+    try{
+      const remote = await gistPull();
+      if(remote){
+        const { entries: curE, cats: curC, contacts: curCon } = dataRef.current;
+
+        // 업무 항목: updatedAt 기준으로 최신 버전 유지
+        const lMap = Object.fromEntries(curE.map(e=>[e.id,e]));
+        const rMap = Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
+        const ids  = new Set([...Object.keys(lMap),...Object.keys(rMap)]);
+        const merged = Array.from(ids).map(id=>{
+          const l=lMap[id], r=rMap[id];
+          if(!l) return r; if(!r) return l;
+          return (l.updatedAt||0)>=(r.updatedAt||0)?l:r;
+        });
+        setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
+
+        // 분류: 원격 우선
+        if(remote.cats) setCats(remote.cats);
+
+        // 담당자: 양쪽 합집합 (같은 id는 원격 우선)
+        const lCMap = Object.fromEntries(curCon.map(c=>[c.id,c]));
+        const rCMap = Object.fromEntries((remote.contacts||[]).map(c=>[c.id,c]));
+        const cIds  = new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
+        setContacts(Array.from(cIds).map(id=>rCMap[id]||lCMap[id]));
+
+        await idbSetMeta("syncedAt", remote.syncedAt);
+      }
+      setSyncStatus("ok");
+      return true;
+    }catch(e){
+      console.error("Gist pull",e);
+      setSyncStatus("error");
+      return false;
+    }
+  },[]);
+
+  // ── 앱 시작 시 Pull ──────────────────────────────────
   useEffect(()=>{
     if(!dbReady) return;
     if(!getGistToken()){ setSyncReady(true); return; }
-    (async()=>{
-      setSyncStatus("syncing");
-      try{
-        const remote=await gistPull();
-        if(remote){
-          const localTs=await idbGetMeta("syncedAt")||0;
-          if(remote.syncedAt>localTs){
-            if(remote.entries?.length){ await idbClear(STORES.entries); for(const e of remote.entries) await idbPut(STORES.entries,e); setEntries(remote.entries.sort((a,b)=>b.createdAt-a.createdAt)); }
-            if(remote.cats){ await idbSetMeta("cats",remote.cats); setCats(remote.cats); }
-            if(remote.contacts?.length){ await idbClear(STORES.contacts); for(const c of remote.contacts) await idbPut(STORES.contacts,c); setContacts(remote.contacts); }
-            await idbSetMeta("syncedAt",remote.syncedAt);
-          }
-        }
-        setSyncStatus("ok");
-      }catch(e){ console.error("Gist pull",e); setSyncStatus("error"); }
-      setSyncReady(true);
-    })();
+    pullAndMerge().finally(()=>setSyncReady(true));
   },[dbReady]);
+
+  // ── 탭/창 활성화 시 자동 Pull (기기 전환 대응) ────────
+  useEffect(()=>{
+    if(!syncReady) return;
+    const handle=()=>{ if(!document.hidden && getGistToken()) pullAndMerge(); };
+    document.addEventListener("visibilitychange", handle);
+    window.addEventListener("focus", handle);
+    return ()=>{
+      document.removeEventListener("visibilitychange", handle);
+      window.removeEventListener("focus", handle);
+    };
+  },[syncReady, pullAndMerge]);
 
   // ── 데이터 변경 시 Gist에 자동 Push (3초 디바운스) ──
   useEffect(()=>{
@@ -818,7 +863,8 @@ function App() {
     syncPushTimer.current=setTimeout(async()=>{
       setSyncStatus("syncing");
       try{
-        await gistPush(entries,cats,contacts);
+        const { entries: e, cats: c, contacts: con } = dataRef.current;
+        await gistPush(e,c,con);
         await idbSetMeta("syncedAt",Date.now());
         setSyncStatus("ok");
       }catch(e){ console.error("Gist push",e); setSyncStatus("error"); }
