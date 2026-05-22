@@ -835,10 +835,14 @@ function App() {
     if(!a.done){
       if(sortBy==="date_desc") return b.updatedAt-a.updatedAt;
       if(sortBy==="date_asc")  return a.updatedAt-b.updatedAt;
+      // 마감기한 임박 우선 → 마감기한 없으면 뒤로
+      const aHas=!!a.deadline, bHas=!!b.deadline;
+      if(aHas&&bHas){ const dc=a.deadline.localeCompare(b.deadline); if(dc!==0) return dc; }
+      else if(aHas) return -1;
+      else if(bHas) return 1;
+      // 마감기한 같거나 둘 다 없으면 우선순위(긴급>보통>낮음)
       const pd=["high","mid","low"].indexOf(a.priority)-["high","mid","low"].indexOf(b.priority);
       if(pd!==0) return pd;
-      if(a.deadline&&b.deadline) return a.deadline.localeCompare(b.deadline);
-      if(a.deadline) return -1; if(b.deadline) return 1;
       return b.updatedAt-a.updatedAt;
     }
     return b.updatedAt-a.updatedAt;
@@ -938,7 +942,7 @@ function App() {
               <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="검색..." style={{width:"100%",padding:"10px 10px 10px 34px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
             </div>
             <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{padding:"10px 8px",border:"1px solid #ddd",borderRadius:8,fontSize:12,background:"#fff",color:"#555",flexShrink:0}}>
-              <option value="priority">긴급순</option>
+              <option value="priority">마감임박순</option>
               <option value="date_desc">최신순</option>
               <option value="date_asc">오래된순</option>
             </select>
