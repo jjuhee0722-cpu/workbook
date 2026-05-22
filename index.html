@@ -347,10 +347,13 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
   const [tagInput,setTagInput] = useState("");
   const photoRef = useRef(null);
   const fileRef  = useRef(null);
+  const bodyRef  = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
   async function addPhotos(files){ const b64s=await Promise.all(Array.from(files).map(fileToB64)); f("photos",[...(form.photos||[]),...b64s]); }
   async function addFiles(files){ const atts=await Promise.all(Array.from(files).map(fileToAttachment)); f("attachments",[...(form.attachments||[]),...atts]); }
+  const autoResize = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(120,el.scrollHeight)+"px"; };
+  useEffect(()=>{ autoResize(bodyRef.current); },[]);
 
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onCancel}>
@@ -376,8 +379,10 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
           style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:15,boxSizing:"border-box",marginBottom:12}}/>
 
         <Lbl>내용</Lbl>
-        <textarea value={form.body} onChange={e=>f("body",e.target.value)} placeholder="세부 내용..." rows={6}
-          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12,minHeight:120,lineHeight:1.7}}/>
+        <textarea ref={bodyRef} value={form.body}
+          onChange={e=>{ f("body",e.target.value); autoResize(e.target); }}
+          placeholder="세부 내용..." rows={6}
+          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12,minHeight:120,lineHeight:1.7,overflow:"hidden"}}/>
 
         <Lbl>📷 사진 (여러 장 가능)</Lbl>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
