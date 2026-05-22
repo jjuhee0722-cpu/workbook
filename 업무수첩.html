@@ -166,6 +166,23 @@ const uid      = () => Date.now().toString(36)+Math.random().toString(36).slice(
 function fileToB64(file) {
   return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res(e.target.result); r.onerror=rej; r.readAsDataURL(file); });
 }
+function fileToAttachment(file) {
+  return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res({name:file.name,type:file.type,size:file.size,data:e.target.result}); r.onerror=rej; r.readAsDataURL(file); });
+}
+function fmtSize(b){ return b<1024?b+"B":b<1048576?(b/1024).toFixed(1)+"KB":(b/1048576).toFixed(1)+"MB"; }
+function attachIcon(t){
+  if(!t) return "📎";
+  if(t.includes("pdf")) return "📄";
+  if(t.includes("word")||t.includes("document")) return "📝";
+  if(t.includes("sheet")||t.includes("excel")||t.includes("spreadsheet")) return "📊";
+  if(t.includes("presentation")||t.includes("powerpoint")) return "📑";
+  if(t.includes("text")) return "📃";
+  if(t.includes("zip")||t.includes("archive")||t.includes("compressed")) return "🗜️";
+  return "📎";
+}
+// 구 버전(photo 단일) → 신 버전(photos 배열) 마이그레이션
+const migrateEntry   = e=>({...e, photos:e.photos||(e.photo?[e.photo]:[]), attachments:e.attachments||[]});
+const migrateContact = c=>({...c, photos:c.photos||(c.photo?[c.photo]:[])});
 function getDday(dl) {
   if(!dl) return null;
   const t=new Date(); t.setHours(0,0,0,0);
@@ -258,7 +275,10 @@ function Card({entry,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
         </div>
         <div style={{fontSize:15,fontWeight:600,lineHeight:1.4,wordBreak:"break-word",color:entry.done?"#999":"#1a1a2e",textDecoration:entry.done?"line-through":"none"}}>{entry.title}</div>
         {entry.body&&<div style={{fontSize:13,color:entry.done?"#bbb":"#666",marginTop:5,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.6}}>{entry.body}</div>}
-        {entry.photo&&<PhotoImg src={entry.photo} alt="첨부" style={{marginTop:8,maxWidth:"100%",maxHeight:200,objectFit:"contain",borderRadius:8,border:"1px solid #eee",display:"block",opacity:entry.done?0.5:1}}/>}
+        <div style={{opacity:entry.done?0.5:1}}>
+          <PhotoGallery photos={entry.photos||(entry.photo?[entry.photo]:[])} />
+          <AttachList attachments={entry.attachments||[]}/>
+        </div>
         {entry.tags&&entry.tags.length>0&&(
           <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:6,opacity:entry.done?0.5:1}}>
             {entry.tags.map(t=><TagChip key={t} tag={t}/>)}
@@ -323,13 +343,14 @@ function SelectionBar({selected,entries,cats,onClear,onMarkDone,onMarkUndone,onD
 //  항목 입력 모달
 // ══════════════════════════════════════════════════════════
 function EntryModal({initial,cats,onSubmit,onCancel}) {
-  const [form,setForm]         = useState(initial);
+  const [form,setForm]         = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[]), attachments:initial.attachments||[]});
   const [tagInput,setTagInput] = useState("");
-  const [preview,setPreview]   = useState(initial.photo||null);
   const photoRef = useRef(null);
+  const fileRef  = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
-  async function handlePhoto(file){try{const b=await fileToB64(file);setPreview(b);f("photo",b);}catch{}}
+  async function addPhotos(files){ const b64s=await Promise.all(Array.from(files).map(fileToB64)); f("photos",[...(form.photos||[]),...b64s]); }
+  async function addFiles(files){ const atts=await Promise.all(Array.from(files).map(fileToAttachment)); f("attachments",[...(form.attachments||[]),...atts]); }
 
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onCancel}>
@@ -358,18 +379,37 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
         <textarea value={form.body} onChange={e=>f("body",e.target.value)} placeholder="세부 내용..." rows={3}
           style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12}}/>
 
-        <Lbl>📷 사진 첨부 (선택)</Lbl>
-        {preview?(
-          <div style={{marginBottom:12,position:"relative",display:"inline-block"}}>
-            <img src={preview} alt="미리보기" style={{maxWidth:"100%",maxHeight:180,objectFit:"contain",borderRadius:8,border:"1px solid #ddd",display:"block"}}/>
-            <button onClick={()=>{setPreview(null);f("photo",null);}} style={{position:"absolute",top:4,right:4,background:"rgba(0,0,0,0.55)",color:"#fff",border:"none",borderRadius:"50%",width:24,height:24,cursor:"pointer",fontSize:13}}>✕</button>
-          </div>
-        ):(
-          <div style={{marginBottom:12}}>
-            <button onClick={()=>photoRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:"pointer",color:"#888"}}>📁 갤러리에서 선택</button>
-            <input ref={photoRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(e.target.files[0])handlePhoto(e.target.files[0]);e.target.value="";}}/>
+        <Lbl>📷 사진 (여러 장 가능)</Lbl>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
+          {(form.photos||[]).map((src,i)=>(
+            <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
+              <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+              <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
+                style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
+            </div>
+          ))}
+          <button onClick={()=>photoRef.current?.click()}
+            style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>＋</button>
+        </div>
+        <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
+
+        <Lbl>📎 파일 첨부 (선택)</Lbl>
+        {(form.attachments||[]).length>0&&(
+          <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:8}}>
+            {(form.attachments||[]).map((att,i)=>(
+              <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f5f5f5",borderRadius:7,padding:"6px 10px",border:"1px solid #eee"}}>
+                <span style={{fontSize:15,flexShrink:0}}>{attachIcon(att.type)}</span>
+                <span style={{flex:1,fontSize:12,color:"#444",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{att.name}</span>
+                {att.size&&<span style={{fontSize:11,color:"#aaa",flexShrink:0}}>{fmtSize(att.size)}</span>}
+                <button onClick={()=>f("attachments",(form.attachments||[]).filter((_,j)=>j!==i))}
+                  style={{background:"none",border:"none",color:"#c0392b",cursor:"pointer",fontSize:16,flexShrink:0,padding:"0 2px"}}>✕</button>
+              </div>
+            ))}
           </div>
         )}
+        <button onClick={()=>fileRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:"pointer",color:"#888",marginBottom:12}}>📎 파일 선택 (PDF·엑셀·Word 등)</button>
+        <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addFiles(e.target.files);e.target.value="";}}/>
+
 
         <Lbl>태그</Lbl>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>{(form.tags||[]).map(t=><TagChip key={t} tag={t} onRemove={()=>f("tags",form.tags.filter(x=>x!==t))}/>)}</div>
@@ -510,7 +550,7 @@ function ContactTab({contacts,onSave}) {
                     {c.email&&<a href={"mailto:"+c.email} style={{fontSize:13,color:"#27ae60",textDecoration:"none"}}>✉️ {c.email}</a>}
                   </div>
                   {c.memo&&<div style={{fontSize:12,color:"#888",marginTop:6,whiteSpace:"pre-wrap"}}>{c.memo}</div>}
-                  {c.photo&&<PhotoImg src={c.photo} alt="명함" style={{marginTop:8,maxWidth:"100%",maxHeight:140,objectFit:"contain",borderRadius:8,border:"1px solid #eee",display:"block"}}/>}
+                  <PhotoGallery photos={c.photos||(c.photo?[c.photo]:[])} thumbStyle={{width:80,height:80}}/>
                 </div>
                 <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
                   <button onClick={()=>setModal({contact:c})} style={{padding:"5px 10px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444"}}>수정</button>
@@ -536,11 +576,10 @@ function ContactTab({contacts,onSave}) {
 }
 
 function ContactForm({initial,onSubmit,onCancel}) {
-  const [form,setForm]       = useState(initial);
-  const [preview,setPreview] = useState(initial.photo||null);
+  const [form,setForm] = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[])});
   const photoRef = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
-  async function handlePhoto(file){ try{ const b=await fileToB64(file); setPreview(b); f("photo",b); }catch{} }
+  async function addPhotos(files){ const b64s=await Promise.all(Array.from(files).map(fileToB64)); f("photos",[...(form.photos||[]),...b64s]); }
   const fields=[
     {key:"company",label:"🏢 회사",   placeholder:"소속 기관 / 회사명"},
     {key:"title",  label:"🪪 직함",   placeholder:"직위 / 직책"},
@@ -554,18 +593,20 @@ function ContactForm({initial,onSubmit,onCancel}) {
       <div style={{fontWeight:700,fontSize:16,color:"#1a1a2e",marginBottom:16}}>{initial.name?"담당자 수정":"담당자 추가"}</div>
 
       {/* 명함 사진 */}
-      <Lbl>📇 명함 사진 (선택)</Lbl>
-      {preview?(
-        <div style={{marginBottom:14,position:"relative",display:"inline-block"}}>
-          <img src={preview} alt="명함" style={{maxWidth:"100%",maxHeight:160,objectFit:"contain",borderRadius:8,border:"1px solid #ddd",display:"block"}}/>
-          <button onClick={()=>{setPreview(null);f("photo",null);}} style={{position:"absolute",top:4,right:4,background:"rgba(0,0,0,0.55)",color:"#fff",border:"none",borderRadius:"50%",width:24,height:24,cursor:"pointer",fontSize:13}}>✕</button>
-        </div>
-      ):(
-        <div style={{marginBottom:14}}>
-          <button onClick={()=>photoRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:"pointer",color:"#888"}}>📁 명함 사진 선택</button>
-          <input ref={photoRef} type="file" accept="image/*" style={{display:"none"}} onChange={e=>{if(e.target.files[0])handlePhoto(e.target.files[0]);e.target.value="";}}/>
-        </div>
-      )}
+      <Lbl>📇 명함 사진 (여러 장 가능)</Lbl>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14,alignItems:"flex-start"}}>
+        {(form.photos||[]).map((src,i)=>(
+          <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
+            <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+            <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
+              style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
+          </div>
+        ))}
+        <button onClick={()=>photoRef.current?.click()}
+          style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>＋</button>
+      </div>
+      <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
+
 
       {fields.map(({key,label,placeholder})=>(
         <div key={key} style={{marginBottom:12}}>
@@ -610,7 +651,7 @@ function TagView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
 function PasteTab({cats,onAddEntry}) {
   const [pasteText,setPasteText]=useState(""); const [errMsg,setErrMsg]=useState(""); const [lines,setLines]=useState([]); const [assigns,setAssigns]=useState({}); const [editingId,setEditingId]=useState(null); const [editVal,setEditVal]=useState(""); const [stage,setStage]=useState("paste");
   function applyPaste(){const ls=pasteText.split("\n").map(l=>l.trim()).filter(l=>l.length>0);if(!ls.length){setErrMsg("텍스트를 입력해주세요.");return;}const mapped=ls.map((t,i)=>({id:i,text:t}));const init={};mapped.forEach(l=>{init[l.id]={text:l.text,category:cats[0]?.id||"task",priority:"mid",include:true};});setLines(mapped);setAssigns(init);setErrMsg("");setStage("assign");}
-  function saveAll(){const toSave=Object.values(assigns).filter(a=>a.include&&a.text.trim());if(!toSave.length){setErrMsg("저장할 항목을 선택하세요.");return;}toSave.forEach(a=>onAddEntry({category:a.category,priority:a.priority,title:a.text.trim(),body:"",date:todayStr(),deadline:"",tags:[],photo:null,done:false}));setPasteText("");setLines([]);setAssigns({});setErrMsg("");setStage("paste");alert(toSave.length+"개 항목이 저장되었습니다.");}
+  function saveAll(){const toSave=Object.values(assigns).filter(a=>a.include&&a.text.trim());if(!toSave.length){setErrMsg("저장할 항목을 선택하세요.");return;}toSave.forEach(a=>onAddEntry({category:a.category,priority:a.priority,title:a.text.trim(),body:"",date:todayStr(),deadline:"",tags:[],photos:[],attachments:[],done:false}));setPasteText("");setLines([]);setAssigns({});setErrMsg("");setStage("paste");alert(toSave.length+"개 항목이 저장되었습니다.");}
   return (
     <div style={{paddingBottom:20}}>
       <div style={{background:"#f0f6fb",border:"1px solid #c5dff5",borderRadius:10,padding:"14px 16px",marginBottom:18,fontSize:13,color:"#1a4a6e",lineHeight:1.8}}><div style={{fontWeight:700,marginBottom:4}}>📋 수첩 내용 빠르게 입력</div><div>① 수첩 사진을 Claude 채팅창에 보내면 텍스트를 추출해드립니다</div><div>② 추출된 텍스트를 아래에 붙여넣기</div><div>③ 분류·우선순위 선택 후 저장</div></div>
@@ -650,38 +691,100 @@ function PasteTab({cats,onAddEntry}) {
 
 
 // ══════════════════════════════════════════════════════════
-//  사진 뷰어 (클릭 확대 + 다운로드)
+//  사진 뷰어 (확대/축소 + 네비게이션 + 다운로드)
 // ══════════════════════════════════════════════════════════
-function PhotoImg({src, alt, style}) {
-  const [open, setOpen] = useState(false);
-  function download() {
-    const ext = (src.match(/data:image\/(\w+)/)?.[1] || "jpeg").replace("jpeg","jpg");
-    const a = document.createElement("a");
-    a.href = src; a.download = (alt||"사진")+"."+ext;
+function PhotoViewer({photos, startIndex, onClose}) {
+  const [idx,   setIdx]   = useState(startIndex||0);
+  const [scale, setScale] = useState(1);
+  const pinchRef = useRef(null);
+
+  useEffect(()=>{ setScale(1); },[idx]);
+
+  const prev = e=>{ e.stopPropagation(); setIdx(i=>(i-1+photos.length)%photos.length); };
+  const next = e=>{ e.stopPropagation(); setIdx(i=>(i+1)%photos.length); };
+
+  function download(e) {
+    e.stopPropagation();
+    const src=photos[idx];
+    const ext=(src.match(/data:image\/(\w+)/)?.[1]||"jpeg").replace("jpeg","jpg");
+    const a=document.createElement("a"); a.href=src; a.download="사진_"+(idx+1)+"."+ext;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   }
+  function onWheel(e){ e.preventDefault(); setScale(s=>Math.max(0.5,Math.min(5,s*(e.deltaY<0?1.1:0.9)))); }
+  function onTouchStart(e){ if(e.touches.length===2) pinchRef.current=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); }
+  function onTouchMove(e){
+    if(e.touches.length===2&&pinchRef.current){
+      e.preventDefault();
+      const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+      setScale(s=>Math.max(0.5,Math.min(5,s*(d/pinchRef.current)))); pinchRef.current=d;
+    }
+  }
+  function onTouchEnd(){ pinchRef.current=null; }
+
+  const OB={padding:"9px 16px",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer",color:"#fff"};
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:600,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",touchAction:"none"}}
+      onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14,width:"100%",maxWidth:"95vw"}}>
+        {/* 이미지 */}
+        <div style={{overflow:"hidden",width:"95vw",maxHeight:"70vh",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:10}}
+          onWheel={onWheel} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+          <img src={photos[idx]} alt={"사진 "+(idx+1)}
+            style={{maxWidth:"95vw",maxHeight:"70vh",objectFit:"contain",borderRadius:8,display:"block",
+              transform:"scale("+scale+")",transformOrigin:"center",transition:"transform 0.05s",userSelect:"none",WebkitUserSelect:"none"}}/>
+        </div>
+        {/* 네비게이션 */}
+        {photos.length>1&&(
+          <div style={{display:"flex",alignItems:"center",gap:14}}>
+            <button onClick={prev} style={{...OB,background:"rgba(255,255,255,0.18)",fontSize:22,padding:"5px 18px"}}>‹</button>
+            <span style={{color:"#ccc",fontSize:13}}>{idx+1} / {photos.length}</span>
+            <button onClick={next} style={{...OB,background:"rgba(255,255,255,0.18)",fontSize:22,padding:"5px 18px"}}>›</button>
+          </div>
+        )}
+        {/* 줌 컨트롤 + 다운로드 + 닫기 */}
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
+          <button onClick={e=>{e.stopPropagation();setScale(s=>Math.min(5,+(s+0.25).toFixed(2)));}} style={{...OB,background:"rgba(255,255,255,0.2)"}}>＋ 확대</button>
+          <button onClick={e=>{e.stopPropagation();setScale(1);}} style={{...OB,background:"rgba(255,255,255,0.1)",fontWeight:400}}>{Math.round(scale*100)}%</button>
+          <button onClick={e=>{e.stopPropagation();setScale(s=>Math.max(0.5,+(s-0.25).toFixed(2)));}} style={{...OB,background:"rgba(255,255,255,0.2)"}}>－ 축소</button>
+          <button onClick={download} style={{...OB,background:"#27ae60"}}>⬇ 다운로드</button>
+          <button onClick={e=>{e.stopPropagation();onClose();}} style={{...OB,background:"rgba(255,255,255,0.15)"}}>✕ 닫기</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PhotoGallery({photos, thumbStyle}) {
+  const [viewIdx, setViewIdx] = useState(null);
+  if(!photos||!photos.length) return null;
   return (
     <>
-      <img src={src} alt={alt} style={{...style, cursor:"zoom-in"}} onClick={()=>setOpen(true)}/>
-      {open&&(
-        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.88)",zIndex:600,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center"}}
-          onClick={()=>setOpen(false)}>
-          <div onClick={e=>e.stopPropagation()} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14,maxWidth:"95vw"}}>
-            <img src={src} alt={alt} style={{maxWidth:"95vw",maxHeight:"75vh",objectFit:"contain",borderRadius:10,display:"block",boxShadow:"0 8px 40px rgba(0,0,0,0.5)"}}/>
-            <div style={{display:"flex",gap:10}}>
-              <button onClick={download}
-                style={{padding:"11px 24px",background:"#27ae60",color:"#fff",border:"none",borderRadius:9,fontSize:14,fontWeight:700,cursor:"pointer",display:"flex",alignItems:"center",gap:6}}>
-                ⬇ 다운로드
-              </button>
-              <button onClick={()=>setOpen(false)}
-                style={{padding:"11px 20px",background:"rgba(255,255,255,0.15)",color:"#fff",border:"1px solid rgba(255,255,255,0.3)",borderRadius:9,fontSize:14,cursor:"pointer"}}>
-                ✕ 닫기
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
+        {photos.map((src,i)=>(
+          <img key={i} src={src} alt={"사진"+(i+1)}
+            style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #eee",cursor:"zoom-in",display:"block",...thumbStyle}}
+            onClick={()=>setViewIdx(i)}/>
+        ))}
+      </div>
+      {viewIdx!==null&&<PhotoViewer photos={photos} startIndex={viewIdx} onClose={()=>setViewIdx(null)}/>}
     </>
+  );
+}
+
+function AttachList({attachments}) {
+  if(!attachments||!attachments.length) return null;
+  function download(att){ const a=document.createElement("a"); a.href=att.data; a.download=att.name; document.body.appendChild(a); a.click(); document.body.removeChild(a); }
+  return (
+    <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+      {attachments.map((att,i)=>(
+        <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f5f5f5",borderRadius:7,padding:"6px 10px",border:"1px solid #eee"}}>
+          <span style={{fontSize:15,flexShrink:0}}>{attachIcon(att.type)}</span>
+          <span style={{flex:1,fontSize:12,color:"#444",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{att.name}</span>
+          {att.size&&<span style={{fontSize:11,color:"#aaa",flexShrink:0}}>{fmtSize(att.size)}</span>}
+          <button onClick={()=>download(att)} style={{padding:"4px 10px",background:"#2980b9",color:"#fff",border:"none",borderRadius:6,fontSize:11,cursor:"pointer",flexShrink:0}}>⬇</button>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -716,9 +819,9 @@ function App() {
           idbGetMeta("cats"),
           idbGetAll(STORES.contacts),
         ]);
-        if(ents.length) setEntries(ents.sort((a,b)=>b.createdAt-a.createdAt));
+        if(ents.length) setEntries(ents.map(migrateEntry).sort((a,b)=>b.createdAt-a.createdAt));
         if(savedCats)   setCats(savedCats);
-        if(savedContacts.length) setContacts(savedContacts);
+        if(savedContacts.length) setContacts(savedContacts.map(migrateContact));
       } catch(e){ console.error("IDB load error",e); }
       setDbReady(true);
     })();
@@ -747,8 +850,8 @@ function App() {
         const ids  = new Set([...Object.keys(lMap),...Object.keys(rMap)]);
         const merged = Array.from(ids).map(id=>{
           const l=lMap[id], r=rMap[id];
-          if(!l) return r; if(!r) return l;
-          return (l.updatedAt||0)>=(r.updatedAt||0)?l:r;
+          if(!l) return migrateEntry(r); if(!r) return migrateEntry(l);
+          return migrateEntry((l.updatedAt||0)>=(r.updatedAt||0)?l:r);
         });
         setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
 
@@ -884,7 +987,7 @@ function App() {
     return b.updatedAt-a.updatedAt;
   });
 
-  const blankForm=()=>({category:catFilter!=="all"?catFilter:(cats[0]?.id||"task"),title:"",body:"",priority:"mid",date:todayStr(),deadline:"",tags:[],photo:null,done:false});
+  const blankForm=()=>({category:catFilter!=="all"?catFilter:(cats[0]?.id||"task"),title:"",body:"",priority:"mid",date:todayStr(),deadline:"",tags:[],photos:[],attachments:[],done:false});
   const selActive = selected.size>0;
   const selBarRef  = useRef(null);
 
