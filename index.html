@@ -376,8 +376,8 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
           style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:15,boxSizing:"border-box",marginBottom:12}}/>
 
         <Lbl>내용</Lbl>
-        <textarea value={form.body} onChange={e=>f("body",e.target.value)} placeholder="세부 내용..." rows={3}
-          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12}}/>
+        <textarea value={form.body} onChange={e=>f("body",e.target.value)} placeholder="세부 내용..." rows={6}
+          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12,minHeight:120,lineHeight:1.7}}/>
 
         <Lbl>📷 사진 (여러 장 가능)</Lbl>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
