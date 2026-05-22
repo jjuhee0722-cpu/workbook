@@ -26,6 +26,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useRef, useCallback } = React;
@@ -107,76 +108,27 @@ async function idbSetMeta(key, value) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  GitHub Gist 동기화 레이어
+//  Supabase 동기화 레이어
 // ══════════════════════════════════════════════════════════
-const GIST_TOKEN_KEY = "wb_gh_token";
-const GIST_ID_KEY    = "wb_gist_id";
-const GIST_FILE      = "workbook_data.json";
-const getGistToken = () => localStorage.getItem(GIST_TOKEN_KEY) || "";
-const getGistId    = () => localStorage.getItem(GIST_ID_KEY)    || "";
-const setGistToken = t  => localStorage.setItem(GIST_TOKEN_KEY, t);
-const setGistId    = id => localStorage.setItem(GIST_ID_KEY, id);
+const SB_URL = "https://qroxbykatxpqvvgaftom.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFyb3hieWthdHhwcXZ2Z2FmdG9tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzODI1NjUsImV4cCI6MjA5NDk1ODU2NX0.wGtQyS234I4TJRBycakvPdfXRySQite7w2OQ9TytoGE";
+const sb = window.supabase.createClient(SB_URL, SB_KEY);
 
-async function gistReq(method, path, body) {
-  const token = getGistToken();
-  if (!token) throw new Error("토큰 없음");
-  const res = await fetch("https://api.github.com/gists" + path, {
-    method,
-    headers: { Authorization: "token " + token, Accept: "application/vnd.github.v3+json", "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.message || "HTTP " + res.status); }
-  return res.json();
+async function sbPull() {
+  const { data, error } = await sb.from("workbook_sync").select("*").eq("id","main").single();
+  if (error) throw error;
+  return data;
 }
 
-async function gistPull() {
-  let id = getGistId();
-  if (!id) {
-    try {
-      const list = await gistReq("GET", "?per_page=100");
-      const found = list.find(g => g.files?.[GIST_FILE]);
-      if (found) { setGistId(found.id); id = found.id; }
-    } catch { return null; }
-  }
-  if (!id) return null;
-  // 브라우저 캐시 방지: Cache-Control: no-cache 헤더 직접 전송
-  const res = await fetch("https://api.github.com/gists/" + id, {
-    headers: { Authorization: "token " + getGistToken(), Accept: "application/vnd.github.v3+json", "Cache-Control": "no-cache", Pragma: "no-cache" }
+async function sbPush(entries, cats, contacts) {
+  const { error } = await sb.from("workbook_sync").upsert({
+    id: "main",
+    entries,
+    cats,
+    contacts,
+    synced_at: Date.now(),
   });
-  // 저장된 ID가 유효하지 않으면(404) ID 삭제 후 목록에서 재탐색
-  if (res.status === 404) {
-    localStorage.removeItem(GIST_ID_KEY);
-    try {
-      const list = await gistReq("GET", "?per_page=100");
-      const found = list.find(g => g.files?.[GIST_FILE]);
-      if (!found) return null;
-      setGistId(found.id);
-      const res2 = await fetch("https://api.github.com/gists/" + found.id, {
-        headers: { Authorization: "token " + getGistToken(), Accept: "application/vnd.github.v3+json", "Cache-Control": "no-cache" }
-      });
-      if (!res2.ok) throw new Error("HTTP " + res2.status);
-      const g2 = await res2.json();
-      const raw2 = g2.files?.[GIST_FILE]?.content;
-      return raw2 ? JSON.parse(raw2) : null;
-    } catch { return null; }
-  }
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  const g = await res.json();
-  const raw = g.files?.[GIST_FILE]?.content;
-  if (!raw) return null;
-  return JSON.parse(raw);
-}
-
-async function gistPush(entries, cats, contacts) {
-  let id = getGistId();
-  const content = JSON.stringify({ entries, cats, contacts, syncedAt: Date.now() });
-  const payload = { description: "업무수첩 데이터", public: false, files: { [GIST_FILE]: { content } } };
-  if (id) {
-    await gistReq("PATCH", "/" + id, payload);
-  } else {
-    const r = await gistReq("POST", "", payload);
-    setGistId(r.id);
-  }
+  if (error) throw error;
 }
 
 // ══════════════════════════════════════════════════════════
@@ -696,73 +648,6 @@ function PasteTab({cats,onAddEntry}) {
   );
 }
 
-// ══════════════════════════════════════════════════════════
-//  동기화 설정 모달
-// ══════════════════════════════════════════════════════════
-function SyncSetupModal({onSave,onClose}){
-  const [token,setToken]=useState(getGistToken());
-  const [testing,setTesting]=useState(false);
-  const [msg,setMsg]=useState("");
-
-  async function testConn(){
-    if(!token.trim()){setMsg("토큰을 입력해주세요.");return;}
-    setTesting(true);setMsg("");
-    try{
-      const res=await fetch("https://api.github.com/user",{headers:{Authorization:"token "+token.trim()}});
-      const d=await res.json();
-      setMsg(res.ok?"✅ 연결 성공: "+d.login:"❌ "+(d.message||"인증 실패"));
-    }catch{setMsg("❌ 네트워크 오류");}
-    setTesting(false);
-  }
-  function save(){
-    if(!token.trim()){setMsg("토큰을 입력해주세요.");return;}
-    setGistToken(token.trim());
-    onSave();onClose();
-  }
-  function reset(){
-    if(!window.confirm("동기화 설정을 초기화하면 이 기기의 클라우드 연결이 끊어집니다.\n계속하시겠습니까?"))return;
-    localStorage.removeItem(GIST_TOKEN_KEY);localStorage.removeItem(GIST_ID_KEY);
-    setToken("");setMsg("초기화 완료. 다시 설정하려면 토큰을 입력하세요.");
-  }
-  return(
-    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:400,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onClose}>
-      <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:"16px 16px 0 0",padding:"20px 18px 36px",width:"100%",maxWidth:560,maxHeight:"90vh",overflowY:"auto",boxSizing:"border-box"}}>
-        <div style={{width:40,height:4,background:"#ddd",borderRadius:2,margin:"0 auto 16px"}}/>
-        <div style={{fontWeight:700,fontSize:16,color:"#1a1a2e",marginBottom:6}}>☁️ 기기 간 동기화 설정</div>
-        <div style={{fontSize:12,color:"#888",marginBottom:16,lineHeight:1.7}}>
-          GitHub Gist를 이용해 컴퓨터↔핸드폰 데이터를 자동 동기화합니다.<br/>
-          각 기기에서 같은 토큰으로 한 번씩 설정하면 됩니다.
-        </div>
-        <div style={{background:"#f0f6fb",border:"1px solid #c5dff5",borderRadius:10,padding:"12px 14px",marginBottom:16,fontSize:12,color:"#1a4a6e",lineHeight:1.9}}>
-          <div style={{fontWeight:700,marginBottom:4}}>📋 토큰 발급 방법 (처음 1회)</div>
-          <div>① github.com 로그인 → 우측 프로필 → <b>Settings</b></div>
-          <div>② 왼쪽 하단 <b>Developer settings</b> → Personal access tokens</div>
-          <div>③ <b>Tokens (classic)</b> → Generate new token (classic)</div>
-          <div>④ 권한에서 <b>gist</b> 항목만 체크 → Generate token</div>
-          <div>⑤ 발급된 <b>ghp_...</b> 토큰을 아래에 붙여넣기</div>
-        </div>
-        <Lbl>GitHub Personal Access Token</Lbl>
-        <input value={token} onChange={e=>setToken(e.target.value)} placeholder="ghp_xxxxxxxxxxxxxxxx" type="password"
-          style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box",marginBottom:10,fontFamily:"monospace"}}/>
-        {msg&&<div style={{padding:"8px 12px",borderRadius:8,marginBottom:10,fontSize:13,
-          background:msg.startsWith("✅")?"#f0fff4":msg.startsWith("초기화")?"#fffbe6":"#fdf2f2",
-          color:msg.startsWith("✅")?"#27ae60":msg.startsWith("초기화")?"#b7770d":"#c0392b",
-          border:"1px solid "+(msg.startsWith("✅")?"#b2f0c8":msg.startsWith("초기화")?"#fde68a":"#f5c6c6")}}>{msg}</div>}
-        <div style={{display:"flex",gap:8,marginBottom:16}}>
-          <button onClick={testConn} disabled={testing}
-            style={{flex:1,padding:"10px",border:"1px solid #ddd",borderRadius:8,background:"#fff",fontSize:13,cursor:testing?"not-allowed":"pointer",color:"#444"}}>
-            {testing?"확인 중...":"🔍 연결 테스트"}
-          </button>
-          <button onClick={reset} style={{padding:"10px 14px",border:"1px solid #fcc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#c0392b"}}>초기화</button>
-        </div>
-        <div style={{display:"flex",gap:10}}>
-          <button onClick={onClose} style={{flex:1,padding:"13px",border:"1px solid #ddd",borderRadius:10,background:"#fff",fontSize:15,cursor:"pointer",color:"#555"}}>취소</button>
-          <button onClick={save} style={{flex:2,padding:"13px",border:"none",borderRadius:10,background:"#1a1a2e",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>저장 및 동기화 시작</button>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 const Empty=({text="항목이 없습니다."})=>(<div style={{textAlign:"center",padding:"50px 0",color:"#bbb"}}><div style={{fontSize:40,marginBottom:10}}>📝</div><div style={{fontSize:14}}>{text}</div></div>);
 
@@ -783,9 +668,7 @@ function App() {
   const [showCatMgr, setShowCatMgr] = useState(false);
   const [selected,   setSelected]   = useState(new Set()); // 선택된 항목 id
   const [dbReady,    setDbReady]    = useState(false);
-  const [syncStatus,    setSyncStatus]    = useState("idle"); // idle|syncing|ok|error
-  const [syncReady,     setSyncReady]     = useState(false);
-  const [showSyncSetup, setShowSyncSetup] = useState(false);
+  const [syncStatus, setSyncStatus] = useState("idle"); // idle|syncing|ok|error
   const syncPushTimer = useRef(null);
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
@@ -816,10 +699,9 @@ function App() {
 
   // ── Pull + 항목별 병합 함수 ──────────────────────────
   const pullAndMerge = useCallback(async () => {
-    if(!getGistToken()) return false;
     setSyncStatus("syncing");
     try{
-      const remote = await gistPull();
+      const remote = await sbPull();
       if(remote){
         const { entries: curE, cats: curC, contacts: curCon } = dataRef.current;
 
@@ -835,20 +717,18 @@ function App() {
         setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
 
         // 분류: 원격 우선
-        if(remote.cats) setCats(remote.cats);
+        if(remote.cats && remote.cats.length) setCats(remote.cats);
 
         // 담당자: 양쪽 합집합 (같은 id는 원격 우선)
         const lCMap = Object.fromEntries(curCon.map(c=>[c.id,c]));
         const rCMap = Object.fromEntries((remote.contacts||[]).map(c=>[c.id,c]));
         const cIds  = new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
         setContacts(Array.from(cIds).map(id=>rCMap[id]||lCMap[id]));
-
-        await idbSetMeta("syncedAt", remote.syncedAt);
       }
       setSyncStatus("ok");
       return true;
     }catch(e){
-      console.error("Gist pull",e);
+      console.error("Supabase pull",e);
       setSyncStatus("error");
       return false;
     }
@@ -857,36 +737,42 @@ function App() {
   // ── 앱 시작 시 Pull ──────────────────────────────────
   useEffect(()=>{
     if(!dbReady) return;
-    if(!getGistToken()){ setSyncReady(true); return; }
-    pullAndMerge().finally(()=>setSyncReady(true));
+    pullAndMerge();
   },[dbReady]);
 
   // ── 탭/창 활성화 시 자동 Pull (기기 전환 대응) ────────
   useEffect(()=>{
-    if(!syncReady) return;
-    const handle=()=>{ if(!document.hidden && getGistToken()) pullAndMerge(); };
+    const handle=()=>{ if(!document.hidden) pullAndMerge(); };
     document.addEventListener("visibilitychange", handle);
     window.addEventListener("focus", handle);
     return ()=>{
       document.removeEventListener("visibilitychange", handle);
       window.removeEventListener("focus", handle);
     };
-  },[syncReady, pullAndMerge]);
+  },[pullAndMerge]);
 
-  // ── 데이터 변경 시 Gist에 자동 Push (3초 디바운스) ──
+  // ── Supabase 실시간 구독 ──────────────────────────────
   useEffect(()=>{
-    if(!syncReady||!getGistToken()) return;
+    if(!dbReady) return;
+    const channel = sb.channel("wb_changes")
+      .on("postgres_changes",{ event:"UPDATE", schema:"public", table:"workbook_sync" },()=>{ pullAndMerge(); })
+      .subscribe();
+    return ()=>{ sb.removeChannel(channel); };
+  },[dbReady, pullAndMerge]);
+
+  // ── 데이터 변경 시 Supabase에 자동 Push (3초 디바운스) ──
+  useEffect(()=>{
+    if(!dbReady) return;
     clearTimeout(syncPushTimer.current);
     syncPushTimer.current=setTimeout(async()=>{
       setSyncStatus("syncing");
       try{
         const { entries: e, cats: c, contacts: con } = dataRef.current;
-        await gistPush(e,c,con);
-        await idbSetMeta("syncedAt",Date.now());
+        await sbPush(e,c,con);
         setSyncStatus("ok");
-      }catch(e){ console.error("Gist push",e); setSyncStatus("error"); }
+      }catch(e){ console.error("Supabase push",e); setSyncStatus("error"); }
     },3000);
-  },[entries,cats,contacts,syncReady]);
+  },[entries,cats,contacts,dbReady]);
 
   // ── 항목 CRUD ────────────────────────────────────────
   const openNew  = ()  => setModal({entry:null});
@@ -907,12 +793,11 @@ function App() {
   function markDone(val){setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
   function deleteSelected(){setEntries(p=>p.filter(e=>!selected.has(e.id)));setSelected(new Set());}
 
-  // ── Gist 수동 동기화 ─────────────────────────────────
+  // ── Supabase 수동 동기화 ─────────────────────────────
   async function manualSync(){
-    if(!getGistToken()){ setShowSyncSetup(true); return; }
     setSyncStatus("syncing");
     try{
-      const remote=await gistPull();
+      const remote=await sbPull();
       let finalEntries=entries,finalCats=cats,finalContacts=contacts;
       if(remote?.entries){
         const lMap=Object.fromEntries(entries.map(e=>[e.id,e]));
@@ -920,39 +805,12 @@ function App() {
         const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
         finalEntries=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return r; if(!r)return l; return l.updatedAt>=r.updatedAt?l:r; });
         setEntries(finalEntries.sort((a,b)=>b.createdAt-a.createdAt));
-        if(remote.cats){ finalCats=remote.cats; setCats(remote.cats); }
+        if(remote.cats && remote.cats.length){ finalCats=remote.cats; setCats(remote.cats); }
         if(remote.contacts?.length){ finalContacts=remote.contacts; setContacts(remote.contacts); }
       }
-      await gistPush(finalEntries,finalCats,finalContacts);
-      await idbSetMeta("syncedAt",Date.now());
+      await sbPush(finalEntries,finalCats,finalContacts);
       setSyncStatus("ok");
     }catch(e){ console.error("manual sync",e); setSyncStatus("error"); alert("동기화 오류: "+e.message); }
-  }
-
-  // 토큰 저장 후 즉시 동기화 시작
-  function afterSyncSetup(){
-    if(!getGistToken()) return;
-    setSyncStatus("syncing");
-    (async()=>{
-      try{
-        const remote=await gistPull();
-        if(remote?.entries?.length){
-          const lMap=Object.fromEntries(entries.map(e=>[e.id,e]));
-          const rMap=Object.fromEntries(remote.entries.map(e=>[e.id,e]));
-          const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
-          const merged=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return r; if(!r)return l; return l.updatedAt>=r.updatedAt?l:r; });
-          setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
-          if(remote.cats) setCats(remote.cats);
-          if(remote.contacts?.length) setContacts(remote.contacts);
-          await idbSetMeta("syncedAt",remote.syncedAt);
-        } else {
-          await gistPush(entries,cats,contacts);
-          await idbSetMeta("syncedAt",Date.now());
-        }
-        setSyncStatus("ok");
-      }catch(e){ console.error("afterSyncSetup",e); setSyncStatus("error"); }
-      setSyncReady(true);
-    })();
   }
 
   // ── 분류 저장 ────────────────────────────────────────
@@ -1005,8 +863,8 @@ function App() {
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <span style={{fontSize:11,color:"#aaa"}}>{totalActive}건</span>
           <button
-            onClick={syncStatus==="error"||!getGistToken() ? ()=>setShowSyncSetup(true) : manualSync}
-            title={syncStatus==="error"?"동기화 오류 — 클릭하여 설정 확인":"지금 동기화"}
+            onClick={manualSync}
+            title={syncStatus==="error"?"동기화 오류 — 클릭하여 재시도":"지금 동기화"}
             style={{padding:"7px 10px",background:syncStatus==="error"?"rgba(231,76,60,0.2)":"transparent",
               border:"1px solid "+(syncStatus==="error"?"#e74c3c":"rgba(255,255,255,0.25)"),
               borderRadius:7,fontSize:12,cursor:"pointer",
@@ -1015,7 +873,7 @@ function App() {
             <span style={{display:"inline-block",animation:syncStatus==="syncing"?"spin 1s linear infinite":"none"}}>
               {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":syncStatus==="error"?"⚠":"☁"}
             </span>
-            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류 (설정)":"동기화"}</span>
+            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":"동기화"}</span>
           </button>
           <button onClick={()=>exportXLSX(entries,cats,contacts)} style={{padding:"7px 10px",background:"#27ae60",color:"#fff",border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer"}}>📊 엑셀</button>
           <button onClick={openNew} style={{padding:"7px 12px",background:"#e74c3c",color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
@@ -1048,13 +906,6 @@ function App() {
             ))}
             <div style={{margin:"12px 14px 0",borderTop:"1px solid #eee",paddingTop:12,display:"flex",flexDirection:"column",gap:10}}>
               <button onClick={()=>{setShowCatMgr(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#555",fontWeight:600}}>⚙️ 분류 관리</button>
-              <button onClick={()=>{setShowSyncSetup(true);setShowSidebar(false);}}
-                style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",fontWeight:600,
-                  color:getGistToken()?"#2980b9":"#555",
-                  display:"flex",alignItems:"center",justifyContent:"center",gap:6}}>
-                <span>☁️ 동기화 설정</span>
-                {getGistToken()&&<span style={{fontSize:10,background:"#e8f4fd",color:"#2980b9",padding:"2px 6px",borderRadius:8}}>연결됨</span>}
-              </button>
               <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#666",cursor:"pointer"}}>
                 <input type="checkbox" checked={showDone} onChange={e=>setShowDone(e.target.checked)} style={{accentColor:"#27ae60",width:16,height:16}}/>완료 항목 보기
               </label>
@@ -1109,7 +960,6 @@ function App() {
       {/* 모달들 */}
       {modal&&<EntryModal initial={modal.entry||blankForm()} cats={cats} onSubmit={submitForm} onCancel={closeModal}/>}
       {showCatMgr&&<CatManageModal cats={cats} onSave={saveCatsWithMigrate} onClose={()=>setShowCatMgr(false)}/>}
-      {showSyncSetup&&<SyncSetupModal onSave={afterSyncSetup} onClose={()=>setShowSyncSetup(false)}/>}
 
       {/* ── 하단 네비게이션 바 ── */}
       <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:190,background:"#fff",borderTop:"1px solid #e0e0da",display:"flex",alignItems:"stretch",boxShadow:"0 -2px 12px rgba(0,0,0,0.08)"}}>
