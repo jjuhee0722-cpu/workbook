@@ -535,9 +535,13 @@ function ContactTab({contacts,onSave}) {
     return [c.company,c.title,c.name,c.role,c.phone,c.email,c.memo].some(v=>(v||"").toLowerCase().includes(q));
   });
 
-  // ── 드래그 앤 드롭 (포인터 이벤트 — 터치·마우스 모두 지원) ──
-  const canDrag   = !search; // 검색 중엔 순서 변경 비활성
-  const isDragging= dragIdx !== null;
+  // ── 드래그 앤 드롭 ──────────────────────────────────
+  // listRef: commitDrag 클로저 내에서 항상 최신 list를 읽기 위해 사용
+  const listRef = useRef(list);
+  useEffect(()=>{ listRef.current = list; }, [list]);
+
+  const canDrag    = !search;
+  const isDragging = dragIdx !== null;
 
   function getCardAtY(y) {
     for(let i=0;i<cardRefs.current.length;i++){
@@ -548,21 +552,18 @@ function ContactTab({contacts,onSave}) {
     }
     return null;
   }
-  function startDrag(e,i){
-    e.preventDefault();
-    e.currentTarget.setPointerCapture(e.pointerId);
+  function beginDrag(i){
     dragIdxRef.current=i; overIdxRef.current=i;
     setDragIdx(i); setOverIdx(i);
   }
-  function moveDrag(e){
-    if(dragIdxRef.current===null) return;
-    const idx=getCardAtY(e.clientY);
+  function updateDrag(clientY){
+    const idx=getCardAtY(clientY);
     if(idx!==null&&idx!==overIdxRef.current){ overIdxRef.current=idx; setOverIdx(idx); }
   }
-  function endDrag(){
+  function commitDrag(){
     const from=dragIdxRef.current, to=overIdxRef.current;
     if(from!==null&&to!==null&&from!==to){
-      const arr=[...list];
+      const arr=[...listRef.current];
       const [item]=arr.splice(from,1);
       arr.splice(to,0,item);
       setList(arr); onSave(arr);
@@ -570,6 +571,28 @@ function ContactTab({contacts,onSave}) {
     dragIdxRef.current=null; overIdxRef.current=null;
     setDragIdx(null); setOverIdx(null);
   }
+
+  // 드래그 중에만 document 레벨 이벤트 등록
+  // (touchmove에 passive:false 필수 — React 합성 이벤트로는 preventDefault 불가)
+  useEffect(()=>{
+    if(dragIdx===null) return;
+    const onMouseMove =(e)=>updateDrag(e.clientY);
+    const onMouseUp   =()=>commitDrag();
+    const onTouchMove =(e)=>{ e.preventDefault(); updateDrag(e.touches[0].clientY); };
+    const onTouchEnd  =()=>commitDrag();
+    document.addEventListener('mousemove',  onMouseMove);
+    document.addEventListener('mouseup',    onMouseUp);
+    document.addEventListener('touchmove',  onTouchMove,  {passive:false});
+    document.addEventListener('touchend',   onTouchEnd);
+    document.addEventListener('touchcancel',onTouchEnd);
+    return ()=>{
+      document.removeEventListener('mousemove',  onMouseMove);
+      document.removeEventListener('mouseup',    onMouseUp);
+      document.removeEventListener('touchmove',  onTouchMove);
+      document.removeEventListener('touchend',   onTouchEnd);
+      document.removeEventListener('touchcancel',onTouchEnd);
+    };
+  },[dragIdx]);
 
   return (
     <div style={{paddingBottom:80}}>
@@ -615,17 +638,16 @@ function ContactTab({contacts,onSave}) {
                   {/* ── 드래그 핸들 ── */}
                   {canDrag&&(
                     <div
-                      onPointerDown={e=>startDrag(e,i)}
-                      onPointerMove={moveDrag}
-                      onPointerUp={endDrag}
-                      onPointerCancel={endDrag}
+                      onMouseDown={e=>{ e.preventDefault(); beginDrag(i); }}
+                      onTouchStart={()=>beginDrag(i)}
                       style={{
                         display:"flex",alignItems:"center",justifyContent:"center",
-                        flexShrink:0,width:28,alignSelf:"stretch",
+                        flexShrink:0,width:36,alignSelf:"stretch",
                         cursor:isDragItem?"grabbing":"grab",
-                        touchAction:"none",userSelect:"none",
-                        color:isDragItem?"#2980b9":"#d0d0d0",
-                        fontSize:18,
+                        touchAction:"none",
+                        userSelect:"none",WebkitUserSelect:"none",
+                        color:isDragItem?"#2980b9":"#ccc",
+                        fontSize:20,letterSpacing:-1,
                       }}>☰</div>
                   )}
 
@@ -1112,13 +1134,12 @@ function App() {
         // 분류: 원격 우선
         if(remote.cats && remote.cats.length) setCats(remote.cats);
 
-        // 담당자: 양쪽 합집합 (같은 id는 원격 우선)
-        const lCMap = Object.fromEntries(curCon.map(c=>[c.id,c]));
-        const rCMap = Object.fromEntries((remote.contacts||[]).map(c=>[c.id,c]));
-        const cIds  = new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
-        // 로컬에만 있는 담당자 확인
-        Array.from(cIds).forEach(id=>{ if(lCMap[id]&&!rCMap[id]) hasLocalWins=true; });
-        setContacts(Array.from(cIds).map(id=>rCMap[id]||lCMap[id]));
+        // 담당자: 원격 순서 우선 (드래그 순서 변경 반영), 로컬에만 있는 건 뒤에 추가
+        const rContacts = (remote.contacts||[]).map(migrateContact);
+        const rIds = new Set(rContacts.map(c=>c.id));
+        const localOnly = curCon.filter(c=>!rIds.has(c.id)).map(migrateContact);
+        if(localOnly.length>0) hasLocalWins=true;
+        setContacts([...rContacts,...localOnly]);
 
         // 로컬 변경이 없었다면 dirty 해제 (cascade push 방지)
         if(!hasLocalWins) localDirtyRef.current = false;
