@@ -114,9 +114,16 @@ const SB_URL = "https://qroxbykatxpqvvgaftom.supabase.co";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFyb3hieWthdHhwcXZ2Z2FmdG9tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzODI1NjUsImV4cCI6MjA5NDk1ODU2NX0.wGtQyS234I4TJRBycakvPdfXRySQite7w2OQ9TytoGE";
 const sb = window.supabase.createClient(SB_URL, SB_KEY);
 
+// ── 비밀번호 잠금 상수 ──
+const PW_KEY     = 'wb_lock_pw';
+const PW_SESSION = 'wb_session_ok';
+
 async function sbPull() {
   const { data, error } = await sb.from("workbook_sync").select("*").eq("id","main").single();
-  if (error) throw error;
+  if (error) {
+    if (error.code === 'PGRST116') return null; // 행 없음 (첫 사용)
+    throw error;
+  }
   return data;
 }
 
@@ -834,6 +841,121 @@ function AttachList({attachments}) {
 const Empty=({text="항목이 없습니다."})=>(<div style={{textAlign:"center",padding:"50px 0",color:"#bbb"}}><div style={{fontSize:40,marginBottom:10}}>📝</div><div style={{fontSize:14}}>{text}</div></div>);
 
 // ══════════════════════════════════════════════════════════
+//  비밀번호 변경 모달
+// ══════════════════════════════════════════════════════════
+function PasswordModal({onClose}) {
+  const hasPw = !!localStorage.getItem(PW_KEY);
+  const [cur,   setCur]   = useState('');
+  const [next1, setNext1] = useState('');
+  const [next2, setNext2] = useState('');
+  const [err,   setErr]   = useState('');
+
+  function save() {
+    if(hasPw && cur !== localStorage.getItem(PW_KEY)){setErr('현재 비밀번호가 틀렸습니다.');return;}
+    if(!next1){setErr('새 비밀번호를 입력해주세요.');return;}
+    if(next1 !== next2){setErr('비밀번호가 일치하지 않습니다.');return;}
+    localStorage.setItem(PW_KEY, next1);
+    alert('비밀번호가 변경되었습니다.');
+    onClose();
+  }
+  function removePw() {
+    if(!window.confirm('비밀번호를 해제하시겠습니까?'))return;
+    if(hasPw && cur !== localStorage.getItem(PW_KEY)){setErr('현재 비밀번호가 틀렸습니다.');return;}
+    localStorage.removeItem(PW_KEY);
+    alert('비밀번호가 해제되었습니다.');
+    onClose();
+  }
+  const IS={width:'100%',padding:'12px 14px',border:'1px solid #ddd',borderRadius:9,fontSize:15,boxSizing:'border-box',marginBottom:10,fontFamily:'inherit'};
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:500,display:'flex',alignItems:'flex-end',justifyContent:'center'}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:'16px 16px 0 0',padding:'24px 20px 36px',width:'100%',maxWidth:480,boxSizing:'border-box'}}>
+        <div style={{width:40,height:4,background:'#ddd',borderRadius:2,margin:'0 auto 18px'}}/>
+        <div style={{fontWeight:700,fontSize:16,color:'#1a1a2e',marginBottom:18}}>🔑 비밀번호 {hasPw?'변경':'설정'}</div>
+        {err&&<div style={{background:'#fdf2f2',border:'1px solid #f5c6c6',borderRadius:8,padding:'10px 14px',marginBottom:14,fontSize:13,color:'#c0392b'}}>{err}</div>}
+        {hasPw&&<><div style={{fontSize:12,color:'#888',marginBottom:4}}>현재 비밀번호</div><input type="password" value={cur} onChange={e=>setCur(e.target.value)} placeholder="현재 비밀번호" style={IS} autoComplete="current-password"/></>}
+        <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호</div>
+        <input type="password" value={next1} onChange={e=>setNext1(e.target.value)} placeholder="새 비밀번호" style={IS} autoComplete="new-password"/>
+        <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호 확인</div>
+        <input type="password" value={next2} onChange={e=>setNext2(e.target.value)} onKeyDown={e=>e.key==='Enter'&&save()} placeholder="비밀번호 재입력" style={{...IS,marginBottom:16}} autoComplete="new-password"/>
+        <button onClick={save} style={{width:'100%',padding:'13px',border:'none',borderRadius:10,background:'#1a1a2e',color:'#fff',fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:8}}>저장</button>
+        {hasPw&&<button onClick={removePw} style={{width:'100%',padding:'11px',border:'1px solid #fcc',borderRadius:10,background:'#fff',color:'#c0392b',fontSize:14,cursor:'pointer',marginBottom:8}}>비밀번호 해제</button>}
+        <button onClick={onClose} style={{width:'100%',padding:'11px',border:'1px solid #ddd',borderRadius:10,background:'#fff',color:'#555',fontSize:14,cursor:'pointer'}}>취소</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  잠금 화면
+// ══════════════════════════════════════════════════════════
+function LockScreen({onUnlock}) {
+  const stored = localStorage.getItem(PW_KEY);
+  const isSetup = !stored;
+  const [pw,    setPw]    = useState('');
+  const [pw2,   setPw2]   = useState('');
+  const [input, setInput] = useState('');
+  const [err,   setErr]   = useState('');
+  const [mode,  setMode]  = useState(isSetup?'setup':'lock');
+  const inputRef = useRef(null);
+
+  useEffect(()=>{ setTimeout(()=>inputRef.current?.focus(),100); },[mode]);
+
+  function unlock(){
+    if(input === localStorage.getItem(PW_KEY)){
+      sessionStorage.setItem(PW_SESSION,'1'); onUnlock();
+    } else {
+      setErr('비밀번호가 틀렸습니다. 다시 입력해주세요.');
+      setInput(''); inputRef.current?.focus();
+    }
+  }
+  function setup(){
+    if(!pw){setErr('비밀번호를 입력해주세요.');return;}
+    if(pw!==pw2){setErr('비밀번호가 일치하지 않습니다.');return;}
+    localStorage.setItem(PW_KEY,pw);
+    sessionStorage.setItem(PW_SESSION,'1'); onUnlock();
+  }
+  function skip(){ sessionStorage.setItem(PW_SESSION,'1'); onUnlock(); }
+
+  const IS={width:'100%',padding:'14px',border:'2px solid #e0e0e0',borderRadius:10,fontSize:20,textAlign:'center',letterSpacing:8,boxSizing:'border-box',marginBottom:12,fontFamily:'inherit',outline:'none'};
+  const IS2={...IS,letterSpacing:2,fontSize:15,textAlign:'left'};
+  const BTN={width:'100%',padding:'14px',border:'none',borderRadius:10,background:'#1a1a2e',color:'#fff',fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:8};
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'#1a1a2e',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,zIndex:999}}>
+      <div style={{background:'#fff',borderRadius:20,padding:'36px 28px',width:'100%',maxWidth:360,boxShadow:'0 20px 60px rgba(0,0,0,0.5)'}}>
+        <div style={{textAlign:'center',marginBottom:24}}>
+          <div style={{fontSize:48,marginBottom:10}}>🔒</div>
+          <div style={{fontSize:22,fontWeight:700,color:'#1a1a2e'}}>업무수첩</div>
+          <div style={{fontSize:13,color:'#aaa',marginTop:6}}>{mode==='setup'?'처음 사용하시는군요! 비밀번호를 설정해주세요':'비밀번호를 입력해주세요'}</div>
+        </div>
+        {err&&<div style={{background:'#fdf2f2',border:'1px solid #f5c6c6',borderRadius:8,padding:'10px 14px',marginBottom:14,fontSize:13,color:'#c0392b',textAlign:'center'}}>{err}</div>}
+
+        {mode==='lock'&&(
+          <>
+            <input ref={inputRef} type="password" value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&unlock()} placeholder="••••••" style={IS} autoComplete="current-password"/>
+            <button onClick={unlock} style={BTN}>잠금 해제</button>
+          </>
+        )}
+        {mode==='setup'&&(
+          <>
+            <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호</div>
+            <input ref={inputRef} type="password" value={pw} onChange={e=>setPw(e.target.value)}
+              placeholder="비밀번호 입력" style={IS2} autoComplete="new-password"/>
+            <div style={{fontSize:12,color:'#888',marginBottom:4}}>비밀번호 확인</div>
+            <input type="password" value={pw2} onChange={e=>setPw2(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&setup()}
+              placeholder="비밀번호 재입력" style={{...IS2,marginBottom:16}} autoComplete="new-password"/>
+            <button onClick={setup} style={BTN}>설정 완료</button>
+            <button onClick={skip} style={{...BTN,background:'transparent',color:'#aaa',border:'1px solid #e0e0e0',fontWeight:400}}>건너뛰기 (비밀번호 없이 사용)</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
 //  메인 앱
 // ══════════════════════════════════════════════════════════
 function App() {
@@ -851,7 +973,10 @@ function App() {
   const [selected,   setSelected]   = useState(new Set()); // 선택된 항목 id
   const [dbReady,    setDbReady]    = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle"); // idle|syncing|ok|error
-  const syncPushTimer = useRef(null);
+  const [unlocked,   setUnlocked]   = useState(()=>!!sessionStorage.getItem(PW_SESSION)||!localStorage.getItem(PW_KEY));
+  const [showPwModal,setShowPwModal]= useState(false);
+  const syncPushTimer  = useRef(null);
+  const localDirtyRef  = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
   useEffect(()=>{
@@ -891,10 +1016,15 @@ function App() {
         const lMap = Object.fromEntries(curE.map(e=>[e.id,e]));
         const rMap = Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
         const ids  = new Set([...Object.keys(lMap),...Object.keys(rMap)]);
+
+        // 로컬 변경이 원격보다 새로운 항목이 있는지 확인 (cascade 방지)
+        let hasLocalWins = false;
         const merged = Array.from(ids).map(id=>{
           const l=lMap[id], r=rMap[id];
-          if(!l) return migrateEntry(r); if(!r) return migrateEntry(l);
-          return migrateEntry((l.updatedAt||0)>=(r.updatedAt||0)?l:r);
+          if(!l) return migrateEntry(r);
+          if(!r){ hasLocalWins=true; return migrateEntry(l); }
+          if((l.updatedAt||0) > (r.updatedAt||0)){ hasLocalWins=true; return migrateEntry(l); }
+          return migrateEntry(r);
         });
         setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
 
@@ -905,7 +1035,12 @@ function App() {
         const lCMap = Object.fromEntries(curCon.map(c=>[c.id,c]));
         const rCMap = Object.fromEntries((remote.contacts||[]).map(c=>[c.id,c]));
         const cIds  = new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
+        // 로컬에만 있는 담당자 확인
+        Array.from(cIds).forEach(id=>{ if(lCMap[id]&&!rCMap[id]) hasLocalWins=true; });
         setContacts(Array.from(cIds).map(id=>rCMap[id]||lCMap[id]));
+
+        // 로컬 변경이 없었다면 dirty 해제 (cascade push 방지)
+        if(!hasLocalWins) localDirtyRef.current = false;
       }
       setSyncStatus("ok");
       return true;
@@ -933,24 +1068,27 @@ function App() {
     };
   },[pullAndMerge]);
 
-  // ── Supabase 실시간 구독 ──────────────────────────────
+  // ── Supabase 실시간 구독 (INSERT·UPDATE 모두 감지) ──
   useEffect(()=>{
     if(!dbReady) return;
     const channel = sb.channel("wb_changes")
-      .on("postgres_changes",{ event:"UPDATE", schema:"public", table:"workbook_sync" },()=>{ pullAndMerge(); })
+      .on("postgres_changes",{ event:"*", schema:"public", table:"workbook_sync" },()=>{ pullAndMerge(); })
       .subscribe();
     return ()=>{ sb.removeChannel(channel); };
   },[dbReady, pullAndMerge]);
 
-  // ── 데이터 변경 시 Supabase에 자동 Push (3초 디바운스) ──
+  // ── 데이터 변경 시 Supabase에 자동 Push (3초 디바운스, 로컬 변경 있을 때만) ──
   useEffect(()=>{
     if(!dbReady) return;
+    if(!localDirtyRef.current) return; // ← 원격에서 당겨온 변경은 다시 올리지 않음 (cascade 방지)
     clearTimeout(syncPushTimer.current);
     syncPushTimer.current=setTimeout(async()=>{
+      if(!localDirtyRef.current) return;
       setSyncStatus("syncing");
       try{
         const { entries: e, cats: c, contacts: con } = dataRef.current;
         await sbPush(e,c,con);
+        localDirtyRef.current = false;
         setSyncStatus("ok");
       }catch(e){ console.error("Supabase push",e); setSyncStatus("error"); }
     },3000);
@@ -962,45 +1100,60 @@ function App() {
   const closeModal=()  => setModal(null);
 
   function submitForm(form) {
+    localDirtyRef.current = true;
     if(modal.entry) setEntries(p=>p.map(e=>e.id===modal.entry.id?{...form,id:modal.entry.id,createdAt:modal.entry.createdAt,updatedAt:Date.now()}:e));
     else            setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);
     closeModal();
   }
-  function deleteEntry(id){if(!window.confirm("삭제하시겠습니까?"))return;setEntries(p=>p.filter(e=>e.id!==id));setSelected(s=>{const n=new Set(s);n.delete(id);return n;});}
-  function toggleDone(id){setEntries(p=>p.map(e=>e.id===id?{...e,done:!e.done,updatedAt:Date.now()}:e));}
-  function addEntry(form){setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);}
+  function deleteEntry(id){if(!window.confirm("삭제하시겠습니까?"))return;localDirtyRef.current=true;setEntries(p=>p.filter(e=>e.id!==id));setSelected(s=>{const n=new Set(s);n.delete(id);return n;});}
+  function toggleDone(id){localDirtyRef.current=true;setEntries(p=>p.map(e=>e.id===id?{...e,done:!e.done,updatedAt:Date.now()}:e));}
+  function addEntry(form){localDirtyRef.current=true;setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);}
 
   // ── 선택 ─────────────────────────────────────────────
   function toggleSelect(id){setSelected(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});}
-  function markDone(val){setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
-  function deleteSelected(){setEntries(p=>p.filter(e=>!selected.has(e.id)));setSelected(new Set());}
+  function markDone(val){localDirtyRef.current=true;setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
+  function deleteSelected(){localDirtyRef.current=true;setEntries(p=>p.filter(e=>!selected.has(e.id)));setSelected(new Set());}
 
   // ── Supabase 수동 동기화 ─────────────────────────────
   async function manualSync(){
     setSyncStatus("syncing");
     try{
       const remote=await sbPull();
-      let finalEntries=entries,finalCats=cats,finalContacts=contacts;
-      if(remote?.entries){
-        const lMap=Object.fromEntries(entries.map(e=>[e.id,e]));
-        const rMap=Object.fromEntries(remote.entries.map(e=>[e.id,e]));
-        const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
-        finalEntries=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return r; if(!r)return l; return l.updatedAt>=r.updatedAt?l:r; });
-        setEntries(finalEntries.sort((a,b)=>b.createdAt-a.createdAt));
-        if(remote.cats && remote.cats.length){ finalCats=remote.cats; setCats(remote.cats); }
-        if(remote.contacts?.length){ finalContacts=remote.contacts; setContacts(remote.contacts); }
+      const {entries:curE,cats:curC,contacts:curCon}=dataRef.current;
+      let finalEntries=curE,finalCats=curC,finalContacts=curCon;
+      if(remote){
+        if(remote.entries){
+          const lMap=Object.fromEntries(curE.map(e=>[e.id,e]));
+          const rMap=Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
+          const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
+          finalEntries=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return migrateEntry(r); if(!r)return migrateEntry(l); return migrateEntry(l.updatedAt>=r.updatedAt?l:r); });
+          setEntries(finalEntries.sort((a,b)=>b.createdAt-a.createdAt));
+        }
+        if(remote.cats?.length){ finalCats=remote.cats; setCats(remote.cats); }
+        if(remote.contacts?.length){
+          const lCMap=Object.fromEntries(curCon.map(c=>[c.id,c]));
+          const rCMap=Object.fromEntries(remote.contacts.map(c=>[c.id,c]));
+          const cIds=new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
+          finalContacts=Array.from(cIds).map(id=>rCMap[id]||lCMap[id]);
+          setContacts(finalContacts);
+        }
       }
       await sbPush(finalEntries,finalCats,finalContacts);
+      localDirtyRef.current=false;
       setSyncStatus("ok");
+      alert("동기화 완료!");
     }catch(e){ console.error("manual sync",e); setSyncStatus("error"); alert("동기화 오류: "+e.message); }
   }
 
   // ── 분류 저장 ────────────────────────────────────────
   function saveCatsWithMigrate(newCats){
+    localDirtyRef.current=true;
     const ids=new Set(newCats.map(c=>c.id));const fallback=newCats[0]?.id;
     setEntries(p=>p.map(e=>ids.has(e.category)?e:{...e,category:fallback}));
     setCats(newCats);
   }
+  // 담당자 저장 — dirty 플래그 포함
+  function saveContacts(next){ localDirtyRef.current=true; setContacts(next); }
 
   // ── 필터/정렬 ────────────────────────────────────────
   const counts={};
@@ -1034,6 +1187,7 @@ function App() {
   const selActive = selected.size>0;
   const selBarRef  = useRef(null);
 
+  if(!unlocked) return <LockScreen onUnlock={()=>setUnlocked(true)}/>;
   if(!dbReady) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",fontSize:15,color:"#888"}}>불러오는 중...</div>;
 
   return (
@@ -1092,6 +1246,9 @@ function App() {
             ))}
             <div style={{margin:"12px 14px 0",borderTop:"1px solid #eee",paddingTop:12,display:"flex",flexDirection:"column",gap:10}}>
               <button onClick={()=>{setShowCatMgr(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#555",fontWeight:600}}>⚙️ 분류 관리</button>
+              <button onClick={()=>{setShowPwModal(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#555",fontWeight:600}}>
+                {localStorage.getItem(PW_KEY)?'🔑 비밀번호 변경':'🔒 비밀번호 설정'}
+              </button>
               <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#666",cursor:"pointer"}}>
                 <input type="checkbox" checked={showDone} onChange={e=>setShowDone(e.target.checked)} style={{accentColor:"#27ae60",width:16,height:16}}/>완료 항목 보기
               </label>
@@ -1135,7 +1292,7 @@ function App() {
         {tab==="date"   &&<DateView entries={entries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>}
         {tab==="tag"    &&<TagView  entries={entries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>}
         {tab==="paste"  &&<PasteTab cats={cats} onAddEntry={addEntry}/>}
-        {tab==="contact"&&<ContactTab contacts={contacts} onSave={setContacts}/>}
+        {tab==="contact"&&<ContactTab contacts={contacts} onSave={saveContacts}/>}
       </div>
 
       {/* FAB */}
@@ -1146,6 +1303,7 @@ function App() {
       {/* 모달들 */}
       {modal&&<EntryModal initial={modal.entry||blankForm()} cats={cats} onSubmit={submitForm} onCancel={closeModal}/>}
       {showCatMgr&&<CatManageModal cats={cats} onSave={saveCatsWithMigrate} onClose={()=>setShowCatMgr(false)}/>}
+      {showPwModal&&<PasswordModal onClose={()=>setShowPwModal(false)}/>}
 
       {/* ── 하단 네비게이션 바 ── */}
       <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:190,background:"#fff",borderTop:"1px solid #e0e0da",display:"flex",alignItems:"stretch",boxShadow:"0 -2px 12px rgba(0,0,0,0.08)"}}>
