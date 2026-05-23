@@ -504,7 +504,38 @@ function CatManageModal({cats,onSave,onClose}) {
 // ══════════════════════════════════════════════════════════
 //  담당자 연락처 탭
 // ══════════════════════════════════════════════════════════
-function ContactTab({contacts,onSave}) {
+// 담당자 탭 전용 저장 버튼 (상태 피드백 포함)
+function SaveBtn({list, onForceSave}) {
+  const [st, setSt] = useState("idle"); // idle | saving | ok | error
+  async function handleSave() {
+    if(st==="saving") return;
+    setSt("saving");
+    try {
+      await onForceSave([...list]);
+      setSt("ok");
+    } catch(e) {
+      setSt("error");
+    }
+    setTimeout(()=>setSt("idle"), 2200);
+  }
+  const MAP = {
+    idle:   {label:"💾 저장",  bg:"#27ae60", disabled:false},
+    saving: {label:"저장 중…", bg:"#95a5a6", disabled:true},
+    ok:     {label:"✓ 저장됨", bg:"#2ecc71", disabled:true},
+    error:  {label:"⚠ 오류",   bg:"#e74c3c", disabled:false},
+  };
+  const m = MAP[st];
+  return (
+    <button onClick={handleSave} disabled={m.disabled}
+      style={{padding:"10px 13px",background:m.bg,color:"#fff",border:"none",borderRadius:8,
+        fontSize:13,fontWeight:700,cursor:m.disabled?"default":"pointer",
+        transition:"background 0.2s",whiteSpace:"nowrap",flexShrink:0}}>
+      {m.label}
+    </button>
+  );
+}
+
+function ContactTab({contacts,onSave,onForceSave}) {
   const [list,setList]       = useState(contacts);
   const [modal,setModal]     = useState(null);
   const [search,setSearch]   = useState("");
@@ -601,6 +632,7 @@ function ContactTab({contacts,onSave}) {
           <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#aaa",fontSize:14,pointerEvents:"none"}}>🔍</span>
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="검색..." style={{width:"100%",padding:"10px 10px 10px 34px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
         </div>
+        <SaveBtn list={list} onForceSave={onForceSave}/>
         <button onClick={()=>setModal({contact:null})} style={{padding:"10px 16px",background:"#1a1a2e",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
       </div>
 
@@ -1257,6 +1289,22 @@ function App() {
   // 담당자 저장 — dirty 플래그 포함
   function saveContacts(next){ localDirtyRef.current=true; setContacts(next); }
 
+  // 담당자 탭 저장 버튼 — 즉시 Supabase push (3초 대기 없음)
+  async function forceSaveContacts(nextContacts) {
+    localDirtyRef.current = true;
+    setContacts(nextContacts);
+    setSyncStatus("syncing");
+    try {
+      const { entries: e, cats: c } = dataRef.current;
+      await sbPush(e, c, nextContacts);
+      localDirtyRef.current = false;
+      setSyncStatus("ok");
+    } catch(err) {
+      console.error("forceSave", err);
+      setSyncStatus("error");
+    }
+  }
+
   // ── 필터/정렬 ────────────────────────────────────────
   const counts={};
   cats.forEach(c=>{counts[c.id]=entries.filter(e=>e.category===c.id&&!e.done).length;});
@@ -1394,7 +1442,7 @@ function App() {
         {tab==="date"   &&<DateView entries={entries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>}
         {tab==="tag"    &&<TagView  entries={entries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>}
         {tab==="paste"  &&<PasteTab cats={cats} onAddEntry={addEntry}/>}
-        {tab==="contact"&&<ContactTab contacts={contacts} onSave={saveContacts}/>}
+        {tab==="contact"&&<ContactTab contacts={contacts} onSave={saveContacts} onForceSave={forceSaveContacts}/>}
       </div>
 
       {/* FAB */}
