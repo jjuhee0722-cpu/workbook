@@ -506,8 +506,13 @@ function CatManageModal({cats,onSave,onClose}) {
 // ══════════════════════════════════════════════════════════
 function ContactTab({contacts,onSave}) {
   const [list,setList]       = useState(contacts);
-  const [modal,setModal]     = useState(null); // null | { contact? }
+  const [modal,setModal]     = useState(null);
   const [search,setSearch]   = useState("");
+  const [dragIdx,setDragIdx] = useState(null);
+  const [overIdx,setOverIdx] = useState(null);
+  const cardRefs   = useRef([]);
+  const dragIdxRef = useRef(null);
+  const overIdxRef = useRef(null);
 
   useEffect(()=>{ setList(contacts); },[contacts]);
 
@@ -530,9 +535,45 @@ function ContactTab({contacts,onSave}) {
     return [c.company,c.title,c.name,c.role,c.phone,c.email,c.memo].some(v=>(v||"").toLowerCase().includes(q));
   });
 
+  // ── 드래그 앤 드롭 (포인터 이벤트 — 터치·마우스 모두 지원) ──
+  const canDrag   = !search; // 검색 중엔 순서 변경 비활성
+  const isDragging= dragIdx !== null;
+
+  function getCardAtY(y) {
+    for(let i=0;i<cardRefs.current.length;i++){
+      const el=cardRefs.current[i];
+      if(!el) continue;
+      const r=el.getBoundingClientRect();
+      if(y>=r.top&&y<=r.bottom) return i;
+    }
+    return null;
+  }
+  function startDrag(e,i){
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragIdxRef.current=i; overIdxRef.current=i;
+    setDragIdx(i); setOverIdx(i);
+  }
+  function moveDrag(e){
+    if(dragIdxRef.current===null) return;
+    const idx=getCardAtY(e.clientY);
+    if(idx!==null&&idx!==overIdxRef.current){ overIdxRef.current=idx; setOverIdx(idx); }
+  }
+  function endDrag(){
+    const from=dragIdxRef.current, to=overIdxRef.current;
+    if(from!==null&&to!==null&&from!==to){
+      const arr=[...list];
+      const [item]=arr.splice(from,1);
+      arr.splice(to,0,item);
+      setList(arr); onSave(arr);
+    }
+    dragIdxRef.current=null; overIdxRef.current=null;
+    setDragIdx(null); setOverIdx(null);
+  }
+
   return (
     <div style={{paddingBottom:80}}>
-      <div style={{display:"flex",gap:8,marginBottom:14}}>
+      <div style={{display:"flex",gap:8,marginBottom:10}}>
         <div style={{flex:1,position:"relative"}}>
           <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#aaa",fontSize:14,pointerEvents:"none"}}>🔍</span>
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="검색..." style={{width:"100%",padding:"10px 10px 10px 34px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
@@ -540,37 +581,77 @@ function ContactTab({contacts,onSave}) {
         <button onClick={()=>setModal({contact:null})} style={{padding:"10px 16px",background:"#1a1a2e",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
       </div>
 
+      {canDrag&&filtered.length>1&&(
+        <div style={{fontSize:11,color:"#bbb",marginBottom:10,textAlign:"center",letterSpacing:0.3}}>
+          ☰ 핸들을 드래그해서 순서 변경
+        </div>
+      )}
+
       {filtered.length===0?(
         <div style={{textAlign:"center",padding:"50px 0",color:"#bbb"}}>
           <div style={{fontSize:40,marginBottom:10}}>👤</div>
           <div style={{fontSize:14}}>담당자가 없습니다.</div>
         </div>
       ):(
-        <div style={{display:"flex",flexDirection:"column",gap:10}}>
-          {filtered.map(c=>(
-            <div key={c.id} style={{background:"#fff",border:"1px solid #ddd",borderLeft:"4px solid #2980b9",borderRadius:10,padding:"14px 14px"}}>
-              <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
-                <div style={{flex:1,minWidth:0}}>
-                  <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6}}>
-                    {c.company&&<span style={{fontSize:11,background:"#e8f4fd",color:"#2980b9",padding:"2px 8px",borderRadius:8,fontWeight:700}}>🏢 {c.company}</span>}
-                    {c.title&&<span style={{fontSize:11,background:"#f0f0f0",color:"#555",padding:"2px 8px",borderRadius:8}}>{c.title}</span>}
+        <div style={{display:"flex",flexDirection:"column",gap:10,userSelect:isDragging?"none":"auto"}}>
+          {filtered.map((c,i)=>{
+            const isDragItem = dragIdx===i;
+            const isOver     = overIdx===i && !isDragItem;
+            return (
+              <div key={c.id}
+                ref={el=>{ cardRefs.current[i]=el; }}
+                style={{
+                  background: isOver?"#eef7ff": isDragItem?"#f7f7f5":"#fff",
+                  border:     isOver?"2px dashed #2980b9": isDragItem?"1px dashed #bbb":"1px solid #ddd",
+                  borderLeft: isDragItem?"4px solid #ccc":isOver?"4px solid #2980b9":"4px solid #2980b9",
+                  borderRadius:10, padding:"14px 14px",
+                  opacity:    isDragItem?0.5:1,
+                  transform:  isDragItem?"scale(1.015)":"none",
+                  boxShadow:  isDragItem?"0 8px 24px rgba(0,0,0,0.13)":"none",
+                  transition: isDragging?"opacity 0.1s,box-shadow 0.1s":"all 0.15s",
+                }}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+
+                  {/* ── 드래그 핸들 ── */}
+                  {canDrag&&(
+                    <div
+                      onPointerDown={e=>startDrag(e,i)}
+                      onPointerMove={moveDrag}
+                      onPointerUp={endDrag}
+                      onPointerCancel={endDrag}
+                      style={{
+                        display:"flex",alignItems:"center",justifyContent:"center",
+                        flexShrink:0,width:28,alignSelf:"stretch",
+                        cursor:isDragItem?"grabbing":"grab",
+                        touchAction:"none",userSelect:"none",
+                        color:isDragItem?"#2980b9":"#d0d0d0",
+                        fontSize:18,
+                      }}>☰</div>
+                  )}
+
+                  <div style={{flex:1,minWidth:0,pointerEvents:isDragging?"none":"auto"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6}}>
+                      {c.company&&<span style={{fontSize:11,background:"#e8f4fd",color:"#2980b9",padding:"2px 8px",borderRadius:8,fontWeight:700}}>🏢 {c.company}</span>}
+                      {c.title&&<span style={{fontSize:11,background:"#f0f0f0",color:"#555",padding:"2px 8px",borderRadius:8}}>{c.title}</span>}
+                    </div>
+                    <div style={{fontSize:16,fontWeight:700,color:"#1a1a2e",marginBottom:4}}>👤 {c.name||"(이름 없음)"}</div>
+                    {c.role&&<div style={{fontSize:13,color:"#555",marginBottom:4}}>💼 {c.role}</div>}
+                    <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                      {c.phone&&<a href={"tel:"+c.phone} style={{fontSize:13,color:"#2980b9",textDecoration:"none"}}>📞 {c.phone}</a>}
+                      {c.email&&<a href={"mailto:"+c.email} style={{fontSize:13,color:"#27ae60",textDecoration:"none"}}>✉️ {c.email}</a>}
+                    </div>
+                    {c.memo&&<div style={{fontSize:12,color:"#888",marginTop:6,whiteSpace:"pre-wrap"}}>{c.memo}</div>}
+                    <PhotoGallery photos={c.photos||(c.photo?[c.photo]:[])} thumbStyle={{width:80,height:80}}/>
                   </div>
-                  <div style={{fontSize:16,fontWeight:700,color:"#1a1a2e",marginBottom:4}}>👤 {c.name||"(이름 없음)"}</div>
-                  {c.role&&<div style={{fontSize:13,color:"#555",marginBottom:4}}>💼 {c.role}</div>}
-                  <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
-                    {c.phone&&<a href={"tel:"+c.phone} style={{fontSize:13,color:"#2980b9",textDecoration:"none"}}>📞 {c.phone}</a>}
-                    {c.email&&<a href={"mailto:"+c.email} style={{fontSize:13,color:"#27ae60",textDecoration:"none"}}>✉️ {c.email}</a>}
+
+                  <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0,pointerEvents:isDragging?"none":"auto"}}>
+                    <button onClick={()=>!isDragging&&setModal({contact:c})} style={{padding:"5px 10px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444"}}>수정</button>
+                    <button onClick={()=>!isDragging&&del(c.id)} style={{padding:"5px 10px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#c0392b"}}>삭제</button>
                   </div>
-                  {c.memo&&<div style={{fontSize:12,color:"#888",marginTop:6,whiteSpace:"pre-wrap"}}>{c.memo}</div>}
-                  <PhotoGallery photos={c.photos||(c.photo?[c.photo]:[])} thumbStyle={{width:80,height:80}}/>
-                </div>
-                <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
-                  <button onClick={()=>setModal({contact:c})} style={{padding:"5px 10px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444"}}>수정</button>
-                  <button onClick={()=>del(c.id)} style={{padding:"5px 10px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#c0392b"}}>삭제</button>
                 </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
