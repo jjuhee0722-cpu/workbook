@@ -1166,12 +1166,24 @@ function App() {
         // 분류: 원격 우선
         if(remote.cats && remote.cats.length) setCats(remote.cats);
 
-        // 담당자: 원격 순서 우선 (드래그 순서 변경 반영), 로컬에만 있는 건 뒤에 추가
+        // 담당자 병합:
+        //   ① 미push 변경 있음 → 로컬 순서 보호 (push 실패·대기 중 원상복구 방지)
+        //   ② 깨끗한 상태 → 원격 순서 적용 (다른 기기의 드래그 반영)
         const rContacts = (remote.contacts||[]).map(migrateContact);
         const rIds = new Set(rContacts.map(c=>c.id));
-        const localOnly = curCon.filter(c=>!rIds.has(c.id)).map(migrateContact);
-        if(localOnly.length>0) hasLocalWins=true;
-        setContacts([...rContacts,...localOnly]);
+        const lContacts = curCon.map(migrateContact);
+        const lIds = new Set(lContacts.map(c=>c.id));
+        const remoteOnly = rContacts.filter(c=>!lIds.has(c.id));
+        const localOnly  = lContacts.filter(c=>!rIds.has(c.id));
+        if(localDirtyRef.current) {
+          // 아직 push 안 된 로컬 변경 있음 → 로컬 순서 유지, 원격 신규만 뒤에 추가
+          setContacts([...lContacts, ...remoteOnly]);
+          hasLocalWins = true;
+        } else {
+          // 로컬 변경 없음 → 원격 순서 그대로 적용
+          if(localOnly.length>0) hasLocalWins = true;
+          setContacts([...rContacts, ...localOnly]);
+        }
 
         // 로컬 변경이 없었다면 dirty 해제 (cascade push 방지)
         if(!hasLocalWins) localDirtyRef.current = false;
@@ -1286,12 +1298,17 @@ function App() {
     setEntries(p=>p.map(e=>ids.has(e.category)?e:{...e,category:fallback}));
     setCats(newCats);
   }
-  // 담당자 저장 — dirty 플래그 포함
-  function saveContacts(next){ localDirtyRef.current=true; setContacts(next); }
+  // 담당자 저장 — dirty 플래그 + dataRef 즉시 동기화 (stale closure 방지)
+  function saveContacts(next){
+    localDirtyRef.current = true;
+    dataRef.current = {...dataRef.current, contacts: next};
+    setContacts(next);
+  }
 
   // 담당자 탭 저장 버튼 — 즉시 Supabase push (3초 대기 없음)
   async function forceSaveContacts(nextContacts) {
     localDirtyRef.current = true;
+    dataRef.current = {...dataRef.current, contacts: nextContacts}; // pull 경쟁 방지
     setContacts(nextContacts);
     setSyncStatus("syncing");
     try {
@@ -1302,6 +1319,7 @@ function App() {
     } catch(err) {
       console.error("forceSave", err);
       setSyncStatus("error");
+      throw err; // SaveBtn이 ⚠ 오류 표시할 수 있도록 re-throw
     }
   }
 
