@@ -1112,6 +1112,7 @@ function App() {
   const [showPwModal,setShowPwModal]= useState(false);
   const syncPushTimer  = useRef(null);
   const localDirtyRef  = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
+  const dirtyCountRef  = useRef(0);     // 로컬 변경 카운터 — push 중 새 변경 감지용
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
   useEffect(()=>{
@@ -1230,11 +1231,12 @@ function App() {
     clearTimeout(syncPushTimer.current);
     syncPushTimer.current=setTimeout(async()=>{
       if(!localDirtyRef.current) return;
+      const snapCount = dirtyCountRef.current;
       setSyncStatus("syncing");
       try{
         const { entries: e, cats: c, contacts: con } = dataRef.current;
         await sbPush(e,c,con);
-        localDirtyRef.current = false;
+        if(dirtyCountRef.current === snapCount) localDirtyRef.current = false;
         setSyncStatus("ok");
       }catch(e){ console.error("Supabase push",e); setSyncStatus("error"); }
     },3000);
@@ -1246,19 +1248,19 @@ function App() {
   const closeModal=()  => setModal(null);
 
   function submitForm(form) {
-    localDirtyRef.current = true;
+    localDirtyRef.current = true; dirtyCountRef.current++;
     if(modal.entry) setEntries(p=>p.map(e=>e.id===modal.entry.id?{...form,id:modal.entry.id,createdAt:modal.entry.createdAt,updatedAt:Date.now()}:e));
     else            setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);
     closeModal();
   }
-  function deleteEntry(id){if(!window.confirm("삭제하시겠습니까?"))return;localDirtyRef.current=true;setEntries(p=>p.filter(e=>e.id!==id));setSelected(s=>{const n=new Set(s);n.delete(id);return n;});}
-  function toggleDone(id){localDirtyRef.current=true;setEntries(p=>p.map(e=>e.id===id?{...e,done:!e.done,updatedAt:Date.now()}:e));}
-  function addEntry(form){localDirtyRef.current=true;setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);}
+  function deleteEntry(id){if(!window.confirm("삭제하시겠습니까?"))return;localDirtyRef.current=true;dirtyCountRef.current++;setEntries(p=>p.filter(e=>e.id!==id));setSelected(s=>{const n=new Set(s);n.delete(id);return n;});}
+  function toggleDone(id){localDirtyRef.current=true;dirtyCountRef.current++;setEntries(p=>p.map(e=>e.id===id?{...e,done:!e.done,updatedAt:Date.now()}:e));}
+  function addEntry(form){localDirtyRef.current=true;dirtyCountRef.current++;setEntries(p=>[{...form,id:uid(),createdAt:Date.now(),updatedAt:Date.now()},...p]);}
 
   // ── 선택 ─────────────────────────────────────────────
   function toggleSelect(id){setSelected(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});}
-  function markDone(val){localDirtyRef.current=true;setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
-  function deleteSelected(){localDirtyRef.current=true;setEntries(p=>p.filter(e=>!selected.has(e.id)));setSelected(new Set());}
+  function markDone(val){localDirtyRef.current=true;dirtyCountRef.current++;setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
+  function deleteSelected(){localDirtyRef.current=true;dirtyCountRef.current++;setEntries(p=>p.filter(e=>!selected.has(e.id)));setSelected(new Set());}
 
   // ── Supabase 수동 동기화 ─────────────────────────────
   async function manualSync(){
@@ -1280,7 +1282,7 @@ function App() {
           const lCMap=Object.fromEntries(curCon.map(c=>[c.id,c]));
           const rCMap=Object.fromEntries(remote.contacts.map(c=>[c.id,c]));
           const cIds=new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
-          finalContacts=Array.from(cIds).map(id=>rCMap[id]||lCMap[id]);
+          finalContacts=Array.from(cIds).map(id=>lCMap[id]||rCMap[id]);
           setContacts(finalContacts);
         }
       }
@@ -1293,28 +1295,29 @@ function App() {
 
   // ── 분류 저장 ────────────────────────────────────────
   function saveCatsWithMigrate(newCats){
-    localDirtyRef.current=true;
+    localDirtyRef.current=true; dirtyCountRef.current++;
     const ids=new Set(newCats.map(c=>c.id));const fallback=newCats[0]?.id;
     setEntries(p=>p.map(e=>ids.has(e.category)?e:{...e,category:fallback}));
     setCats(newCats);
   }
   // 담당자 저장 — dirty 플래그 + dataRef 즉시 동기화 (stale closure 방지)
   function saveContacts(next){
-    localDirtyRef.current = true;
+    localDirtyRef.current = true; dirtyCountRef.current++;
     dataRef.current = {...dataRef.current, contacts: next};
     setContacts(next);
   }
 
   // 담당자 탭 저장 버튼 — 즉시 Supabase push (3초 대기 없음)
   async function forceSaveContacts(nextContacts) {
-    localDirtyRef.current = true;
+    localDirtyRef.current = true; dirtyCountRef.current++;
     dataRef.current = {...dataRef.current, contacts: nextContacts}; // pull 경쟁 방지
     setContacts(nextContacts);
+    const snapCount = dirtyCountRef.current; // push 시작 시점 카운터 스냅샷
     setSyncStatus("syncing");
     try {
       const { entries: e, cats: c } = dataRef.current;
       await sbPush(e, c, nextContacts);
-      localDirtyRef.current = false;
+      if(dirtyCountRef.current === snapCount) localDirtyRef.current = false;
       setSyncStatus("ok");
     } catch(err) {
       console.error("forceSave", err);
