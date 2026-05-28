@@ -1177,8 +1177,8 @@ function App() {
         const remoteOnly = rContacts.filter(c=>!lIds.has(c.id));
         const localOnly  = lContacts.filter(c=>!rIds.has(c.id));
         if(localDirtyRef.current) {
-          // 미push 변경 있음 → 로컬 완전 신뢰 (삭제·순서 보호, remoteOnly 무시)
-          setContacts(lContacts);
+          // 미push 변경 있음 → 로컬 완전 신뢰
+          // setContacts 생략: 이미 로컬 state 올바름, 불필요한 리렌더·타이머 리셋 방지
           hasLocalWins = true;
         } else {
           // 로컬 변경 없음 → 원격 순서 그대로 적용
