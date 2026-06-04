@@ -118,24 +118,57 @@ const sb = window.supabase.createClient(SB_URL, SB_KEY);
 const PW_KEY     = 'wb_lock_pw';
 const PW_SESSION = 'wb_session_ok';
 
-async function sbPull() {
-  const { data, error } = await sb.from("workbook_sync").select("*").eq("id","main").single();
-  if (error) {
-    if (error.code === 'PGRST116') return null; // 행 없음 (첫 사용)
-    throw error;
+// 직렬화 잠금 — pull/push가 동시에 겹쳐 서로 덮어쓰는 경쟁(race) 방지
+let _syncChain = Promise.resolve();
+function withSyncLock(fn) {
+  const run = _syncChain.then(fn, fn);   // 이전 작업의 성공/실패와 무관하게 순차 실행
+  _syncChain = run.catch(() => {});      // 한 번 실패해도 체인이 막히지 않도록
+  return run;
+}
+
+// 일시적 네트워크 오류 자동 재시도 (지수 백오프). 인증/권한 오류는 재시도하지 않음.
+async function withRetry(fn, { tries = 3, base = 600 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      const code = e && (e.code || e.status);
+      if (code === 401 || code === 403 || code === 'PGRST301') break; // 권한 문제는 즉시 중단
+      if (i < tries - 1) await new Promise(r => setTimeout(r, base * Math.pow(2, i)));
+    }
   }
+  throw lastErr;
+}
+
+// 우리가 마지막으로 기록한 synced_at 토큰 — 자기 자신이 만든 실시간 이벤트(메아리)를 무시하기 위함
+let _lastWriteToken = 0;
+
+async function sbPull() {
+  // maybeSingle: 행이 없으면 에러 대신 null 반환 (첫 사용 대응)
+  const { data, error } = await sb.from("workbook_sync").select("*").eq("id", "main").maybeSingle();
+  if (error) throw error;
   return data;
 }
 
 async function sbPush(entries, cats, contacts) {
+  const token = Date.now();
   const { error } = await sb.from("workbook_sync").upsert({
     id: "main",
     entries,
     cats,
     contacts,
-    synced_at: Date.now(),
+    synced_at: token,
   });
   if (error) throw error;
+  _lastWriteToken = token;   // 직후 들어올 자기 메아리 이벤트를 식별하는 데 사용
+  return token;
+}
+
+// 대략적인 페이로드 크기(바이트) — 사진·첨부 base64가 한도를 넘는지 점검
+function approxPayloadBytes(entries, cats, contacts) {
+  try { return new Blob([JSON.stringify({ entries, cats, contacts })]).size; }
+  catch { return 0; }
 }
 
 // ══════════════════════════════════════════════════════════
@@ -176,6 +209,34 @@ function fileToB64(file) {
 function fileToAttachment(file) {
   return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res({name:file.name,type:file.type,size:file.size,data:e.target.result}); r.onerror=rej; r.readAsDataURL(file); });
 }
+
+// ── Supabase Storage 업로드 ───────────────────────────────
+// 사진·첨부를 한 행에 base64로 욱여넣지 않고 Storage 버킷에 올린 뒤 URL만 저장(정석).
+// 버킷 미설정 등으로 업로드 실패 시 base64로 자동 폴백 → 앱은 절대 멈추지 않음.
+const SB_BUCKET = "workbook";
+async function sbUpload(file) {
+  const safe = (file.name||"file").replace(/[^\w.\-]/g,"_").slice(-40);
+  const path = `${Date.now()}_${Math.random().toString(36).slice(2,8)}_${safe}`;
+  const { error } = await sb.storage.from(SB_BUCKET).upload(path, file, {
+    cacheControl: "31536000", upsert: false, contentType: file.type || undefined,
+  });
+  if (error) throw error;
+  const { data } = sb.storage.from(SB_BUCKET).getPublicUrl(path);
+  return { url: data.publicUrl, path };
+}
+// 사진 1장 → URL 문자열 (실패 시 base64 data URL)
+async function uploadPhoto(file) {
+  try { const { url } = await sbUpload(file); return url; }
+  catch (e) { console.warn("[storage] 사진 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToB64(file); }
+}
+// 첨부 1개 → {name,type,size,url} (실패 시 base64 data 보유 객체)
+async function uploadAttachment(file) {
+  try { const { url } = await sbUpload(file); return { name:file.name, type:file.type, size:file.size, url }; }
+  catch (e) { console.warn("[storage] 첨부 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToAttachment(file); }
+}
+// 첨부/사진 소스 추출 (신규 url 우선, 구버전 base64 호환)
+const attSrc = a => a && (a.url || a.data) || "";
+
 function fmtSize(b){ return b<1024?b+"B":b<1048576?(b/1024).toFixed(1)+"KB":(b/1048576).toFixed(1)+"MB"; }
 function attachIcon(t){
   if(!t) return "📎";
@@ -352,13 +413,14 @@ function SelectionBar({selected,entries,cats,onClear,onMarkDone,onMarkUndone,onD
 function EntryModal({initial,cats,onSubmit,onCancel}) {
   const [form,setForm]         = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[]), attachments:initial.attachments||[]});
   const [tagInput,setTagInput] = useState("");
+  const [uploading,setUploading] = useState(false);
   const photoRef = useRef(null);
   const fileRef  = useRef(null);
   const bodyRef  = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
-  async function addPhotos(files){ const b64s=await Promise.all(Array.from(files).map(fileToB64)); f("photos",[...(form.photos||[]),...b64s]); }
-  async function addFiles(files){ const atts=await Promise.all(Array.from(files).map(fileToAttachment)); f("attachments",[...(form.attachments||[]),...atts]); }
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
+  async function addFiles(files){ setUploading(true); try{ const atts=await Promise.all(Array.from(files).map(uploadAttachment)); setForm(p=>({...p,attachments:[...(p.attachments||[]),...atts]})); } finally{ setUploading(false); } }
   const autoResize = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(120,el.scrollHeight)+"px"; };
   useEffect(()=>{ autoResize(bodyRef.current); },[]);
 
@@ -400,8 +462,8 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
                 style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
             </div>
           ))}
-          <button onClick={()=>photoRef.current?.click()}
-            style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>＋</button>
+          <button onClick={()=>!uploading&&photoRef.current?.click()}
+            style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:uploading?"default":"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{uploading?<span style={{display:"inline-block",fontSize:18,animation:"spin 1s linear infinite"}}>⟳</span>:"＋"}</button>
         </div>
         <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
 
@@ -419,7 +481,7 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
             ))}
           </div>
         )}
-        <button onClick={()=>fileRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:"pointer",color:"#888",marginBottom:12}}>📎 파일 선택 (PDF·엑셀·Word 등)</button>
+        <button onClick={()=>!uploading&&fileRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:uploading?"default":"pointer",color:"#888",marginBottom:12}}>{uploading?"⟳ 업로드 중…":"📎 파일 선택 (PDF·엑셀·Word 등)"}</button>
         <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addFiles(e.target.files);e.target.value="";}}/>
 
 
@@ -571,25 +633,46 @@ function ContactTab({contacts,onSave,onForceSave}) {
   const listRef = useRef(list);
   useEffect(()=>{ listRef.current = list; }, [list]);
 
+  const lastYRef     = useRef(0);   // 마지막 포인터 Y (자동 스크롤 중 재평가용)
+  const scrollSpdRef = useRef(0);   // 자동 스크롤 속도(px/frame)
+  const rafRef       = useRef(null);
+
   const canDrag    = !search;
   const isDragging = dragIdx !== null;
 
+  // 포인터 Y에 해당하는 카드 인덱스. 카드 위가 아니면(간격·목록 밖) 가장 가까운/끝 카드로 보정.
   function getCardAtY(y) {
-    for(let i=0;i<cardRefs.current.length;i++){
+    const n = filtered.length;
+    let firstTop=Infinity, lastBottom=-Infinity, firstIdx=0, lastIdx=0;
+    let bestIdx=null, bestDist=Infinity;
+    for(let i=0;i<n;i++){
       const el=cardRefs.current[i];
       if(!el) continue;
       const r=el.getBoundingClientRect();
-      if(y>=r.top&&y<=r.bottom) return i;
+      if(r.top<firstTop){ firstTop=r.top; firstIdx=i; }
+      if(r.bottom>lastBottom){ lastBottom=r.bottom; lastIdx=i; }
+      if(y>=r.top && y<=r.bottom) return i;        // 카드 안 → 즉시 확정
+      const c=(r.top+r.bottom)/2, d=Math.abs(y-c); // 간격일 때 대비, 중심 최근접 후보
+      if(d<bestDist){ bestDist=d; bestIdx=i; }
     }
-    return null;
+    if(bestIdx===null) return null;
+    if(y<firstTop) return firstIdx;                // 목록 위쪽 밖 → 맨 앞
+    if(y>lastBottom) return lastIdx;               // 목록 아래쪽 밖 → 맨 뒤
+    return bestIdx;                                // 카드 사이 간격 → 최근접 카드
   }
   function beginDrag(i){
     dragIdxRef.current=i; overIdxRef.current=i;
     setDragIdx(i); setOverIdx(i);
   }
   function updateDrag(clientY){
+    lastYRef.current=clientY;
     const idx=getCardAtY(clientY);
     if(idx!==null&&idx!==overIdxRef.current){ overIdxRef.current=idx; setOverIdx(idx); }
+    // 화면 위/아래 가장자리에 가까우면 자동 스크롤 속도 설정
+    const EDGE=90, MAX=18, h=window.innerHeight;
+    if(clientY<EDGE)            scrollSpdRef.current = -Math.ceil((EDGE-clientY)/EDGE*MAX);
+    else if(clientY>h-EDGE)     scrollSpdRef.current =  Math.ceil((clientY-(h-EDGE))/EDGE*MAX);
+    else                        scrollSpdRef.current = 0;
   }
   function commitDrag(){
     const from=dragIdxRef.current, to=overIdxRef.current;
@@ -599,11 +682,12 @@ function ContactTab({contacts,onSave,onForceSave}) {
       arr.splice(to,0,item);
       setList(arr); onSave(arr);
     }
+    scrollSpdRef.current=0;
     dragIdxRef.current=null; overIdxRef.current=null;
     setDragIdx(null); setOverIdx(null);
   }
 
-  // 드래그 중에만 document 레벨 이벤트 등록
+  // 드래그 중에만 document 레벨 이벤트 + 가장자리 자동 스크롤 루프 등록
   // (touchmove에 passive:false 필수 — React 합성 이벤트로는 preventDefault 불가)
   useEffect(()=>{
     if(dragIdx===null) return;
@@ -616,7 +700,23 @@ function ContactTab({contacts,onSave,onForceSave}) {
     document.addEventListener('touchmove',  onTouchMove,  {passive:false});
     document.addEventListener('touchend',   onTouchEnd);
     document.addEventListener('touchcancel',onTouchEnd);
+
+    let active=true;
+    const step=()=>{
+      if(!active) return;
+      const spd=scrollSpdRef.current;
+      if(spd!==0){
+        window.scrollBy(0,spd);
+        updateDrag(lastYRef.current); // 스크롤 후 포인터 아래 카드 다시 계산
+      }
+      rafRef.current=requestAnimationFrame(step);
+    };
+    rafRef.current=requestAnimationFrame(step);
+
     return ()=>{
+      active=false;
+      if(rafRef.current) cancelAnimationFrame(rafRef.current);
+      scrollSpdRef.current=0;
       document.removeEventListener('mousemove',  onMouseMove);
       document.removeEventListener('mouseup',    onMouseUp);
       document.removeEventListener('touchmove',  onTouchMove);
@@ -724,9 +824,10 @@ function ContactTab({contacts,onSave,onForceSave}) {
 
 function ContactForm({initial,onSubmit,onCancel}) {
   const [form,setForm] = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[])});
+  const [uploading,setUploading] = useState(false);
   const photoRef = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
-  async function addPhotos(files){ const b64s=await Promise.all(Array.from(files).map(fileToB64)); f("photos",[...(form.photos||[]),...b64s]); }
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
   const fields=[
     {key:"company",label:"🏢 회사",   placeholder:"소속 기관 / 회사명"},
     {key:"title",  label:"🪪 직함",   placeholder:"직위 / 직책"},
@@ -749,8 +850,8 @@ function ContactForm({initial,onSubmit,onCancel}) {
               style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
           </div>
         ))}
-        <button onClick={()=>photoRef.current?.click()}
-          style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>＋</button>
+        <button onClick={()=>!uploading&&photoRef.current?.click()}
+          style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:uploading?"default":"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{uploading?<span style={{display:"inline-block",fontSize:18,animation:"spin 1s linear infinite"}}>⟳</span>:"＋"}</button>
       </div>
       <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
 
@@ -891,9 +992,13 @@ function PhotoViewer({photos, startIndex, onClose}) {
   function download(e) {
     e.stopPropagation();
     const src=photos[idx];
-    const ext=(src.match(/data:image\/(\w+)/)?.[1]||"jpeg").replace("jpeg","jpg");
-    const a=document.createElement("a"); a.href=src; a.download="사진_"+(idx+1)+"."+ext;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    if(src.startsWith("data:")){
+      const ext=(src.match(/data:image\/(\w+)/)?.[1]||"jpeg").replace("jpeg","jpg");
+      const a=document.createElement("a"); a.href=src; a.download="사진_"+(idx+1)+"."+ext;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    } else {
+      window.open(src,"_blank","noopener");
+    }
   }
   function onWheel(e){ e.preventDefault(); setScale(s=>Math.max(0.5,Math.min(5,s*(e.deltaY<0?1.1:0.9)))); }
   function onTouchStart(e){ if(e.touches.length===2) pinchRef.current=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); }
@@ -958,7 +1063,11 @@ function PhotoGallery({photos, thumbStyle}) {
 
 function AttachList({attachments}) {
   if(!attachments||!attachments.length) return null;
-  function download(att){ const a=document.createElement("a"); a.href=att.data; a.download=att.name; document.body.appendChild(a); a.click(); document.body.removeChild(a); }
+  function download(att){
+    const src=attSrc(att); if(!src) return;
+    if(src.startsWith("data:")){ const a=document.createElement("a"); a.href=src; a.download=att.name; document.body.appendChild(a); a.click(); document.body.removeChild(a); }
+    else { window.open(src,"_blank","noopener"); }
+  }
   return (
     <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
       {attachments.map((att,i)=>(
@@ -1139,62 +1248,83 @@ function App() {
   const dataRef = useRef({ entries, cats, contacts });
   useEffect(()=>{ dataRef.current = { entries, cats, contacts }; });
 
-  // ── Pull + 항목별 병합 함수 ──────────────────────────
+  // ── Pull + 항목별 병합 함수 (잠금·재시도·오프라인 처리 포함) ──
   const pullAndMerge = useCallback(async () => {
-    setSyncStatus("syncing");
-    try{
-      const remote = await sbPull();
-      if(remote){
-        const { entries: curE, cats: curC, contacts: curCon } = dataRef.current;
+    if(!navigator.onLine){ setSyncStatus("offline"); return false; }
+    return withSyncLock(async () => {
+      setSyncStatus("syncing");
+      try{
+        const remote = await withRetry(sbPull);
+        if(remote){
+          const { entries: curE, cats: curC, contacts: curCon } = dataRef.current;
 
-        // 업무 항목: updatedAt 기준으로 최신 버전 유지
-        const lMap = Object.fromEntries(curE.map(e=>[e.id,e]));
-        const rMap = Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
-        const ids  = new Set([...Object.keys(lMap),...Object.keys(rMap)]);
+          // 업무 항목: updatedAt 기준으로 최신 버전 유지
+          const lMap = Object.fromEntries(curE.map(e=>[e.id,e]));
+          const rMap = Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
+          const ids  = new Set([...Object.keys(lMap),...Object.keys(rMap)]);
 
-        // 로컬 변경이 원격보다 새로운 항목이 있는지 확인 (cascade 방지)
-        let hasLocalWins = false;
-        const merged = Array.from(ids).map(id=>{
-          const l=lMap[id], r=rMap[id];
-          if(!l) return migrateEntry(r);
-          if(!r){ hasLocalWins=true; return migrateEntry(l); }
-          if((l.updatedAt||0) > (r.updatedAt||0)){ hasLocalWins=true; return migrateEntry(l); }
-          return migrateEntry(r);
-        });
-        setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
+          // 로컬 변경이 원격보다 새로운 항목이 있는지 확인 (cascade 방지)
+          let hasLocalWins = false;
+          const merged = Array.from(ids).map(id=>{
+            const l=lMap[id], r=rMap[id];
+            if(!l) return migrateEntry(r);
+            if(!r){ hasLocalWins=true; return migrateEntry(l); }
+            if((l.updatedAt||0) > (r.updatedAt||0)){ hasLocalWins=true; return migrateEntry(l); }
+            return migrateEntry(r);
+          });
+          setEntries(merged.sort((a,b)=>b.createdAt-a.createdAt));
 
-        // 분류: 원격 우선
-        if(remote.cats && remote.cats.length) setCats(remote.cats);
+          // 분류: 원격 우선
+          if(remote.cats && remote.cats.length) setCats(remote.cats);
 
-        // 담당자 병합:
-        //   ① 미push 변경 있음 → 로컬 순서 보호 (push 실패·대기 중 원상복구 방지)
-        //   ② 깨끗한 상태 → 원격 순서 적용 (다른 기기의 드래그 반영)
-        const rContacts = (remote.contacts||[]).map(migrateContact);
-        const rIds = new Set(rContacts.map(c=>c.id));
-        const lContacts = curCon.map(migrateContact);
-        const lIds = new Set(lContacts.map(c=>c.id));
-        const remoteOnly = rContacts.filter(c=>!lIds.has(c.id));
-        const localOnly  = lContacts.filter(c=>!rIds.has(c.id));
-        if(localDirtyRef.current) {
-          // 아직 push 안 된 로컬 변경 있음 → 로컬 순서 유지, 원격 신규만 뒤에 추가
-          setContacts([...lContacts, ...remoteOnly]);
-          hasLocalWins = true;
-        } else {
-          // 로컬 변경 없음 → 원격 순서 그대로 적용
-          if(localOnly.length>0) hasLocalWins = true;
-          setContacts([...rContacts, ...localOnly]);
+          // 담당자 병합:
+          //   ① 미push 변경 있음 → 로컬 순서 보호 (push 실패·대기 중 원상복구 방지)
+          //   ② 깨끗한 상태 → 원격 순서 적용 (다른 기기의 드래그 반영)
+          const rContacts = (remote.contacts||[]).map(migrateContact);
+          const rIds = new Set(rContacts.map(c=>c.id));
+          const lContacts = curCon.map(migrateContact);
+          const lIds = new Set(lContacts.map(c=>c.id));
+          const remoteOnly = rContacts.filter(c=>!lIds.has(c.id));
+          const localOnly  = lContacts.filter(c=>!rIds.has(c.id));
+          if(localDirtyRef.current) {
+            setContacts([...lContacts, ...remoteOnly]);
+            hasLocalWins = true;
+          } else {
+            if(localOnly.length>0) hasLocalWins = true;
+            setContacts([...rContacts, ...localOnly]);
+          }
+
+          if(!hasLocalWins) localDirtyRef.current = false;
         }
-
-        // 로컬 변경이 없었다면 dirty 해제 (cascade push 방지)
-        if(!hasLocalWins) localDirtyRef.current = false;
+        setSyncStatus("ok");
+        return true;
+      }catch(e){
+        console.error("Supabase pull",e);
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        return false;
       }
-      setSyncStatus("ok");
-      return true;
-    }catch(e){
-      console.error("Supabase pull",e);
-      setSyncStatus("error");
-      return false;
-    }
+    });
+  },[]);
+
+  // ── Push 실행 (잠금·재시도, 로컬 변경 있을 때만) ──────
+  const flushPush = useCallback(async () => {
+    if(!localDirtyRef.current) return;
+    if(!navigator.onLine){ setSyncStatus("offline"); return; }
+    return withSyncLock(async () => {
+      if(!localDirtyRef.current) return;
+      setSyncStatus("syncing");
+      try{
+        const { entries: e, cats: c, contacts: con } = dataRef.current;
+        const bytes = approxPayloadBytes(e,c,con);
+        if(bytes > 4*1024*1024) console.warn("[sync] 페이로드가 큽니다(", (bytes/1048576).toFixed(1),"MB). 사진/첨부가 많으면 동기화가 느려지거나 실패할 수 있습니다.");
+        await withRetry(()=>sbPush(e,c,con));
+        localDirtyRef.current = false;
+        setSyncStatus("ok");
+      }catch(err){
+        console.error("Supabase push",err);
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+      }
+    });
   },[]);
 
   // ── 앱 시작 시 Pull ──────────────────────────────────
@@ -1214,31 +1344,40 @@ function App() {
     };
   },[pullAndMerge]);
 
-  // ── Supabase 실시간 구독 (INSERT·UPDATE 모두 감지) ──
+  // ── 온라인/오프라인 전환 처리 ─────────────────────────
+  useEffect(()=>{
+    const onOnline  = ()=>{ if(localDirtyRef.current) flushPush(); else pullAndMerge(); };
+    const onOffline = ()=> setSyncStatus("offline");
+    window.addEventListener("online",  onOnline);
+    window.addEventListener("offline", onOffline);
+    if(!navigator.onLine) setSyncStatus("offline");
+    return ()=>{
+      window.removeEventListener("online",  onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  },[pullAndMerge, flushPush]);
+
+  // ── Supabase 실시간 구독 (자기 메아리는 무시) ────────
   useEffect(()=>{
     if(!dbReady) return;
     const channel = sb.channel("wb_changes")
-      .on("postgres_changes",{ event:"*", schema:"public", table:"workbook_sync" },()=>{ pullAndMerge(); })
+      .on("postgres_changes",{ event:"*", schema:"public", table:"workbook_sync" }, (payload)=>{
+        const incoming = payload && payload.new && payload.new.synced_at;
+        // 방금 내가 올린 변경이 되돌아온 것이면 무시 (불필요한 재-pull·경쟁 방지)
+        if(incoming && Number(incoming) === _lastWriteToken) return;
+        pullAndMerge();
+      })
       .subscribe();
     return ()=>{ sb.removeChannel(channel); };
   },[dbReady, pullAndMerge]);
 
-  // ── 데이터 변경 시 Supabase에 자동 Push (3초 디바운스, 로컬 변경 있을 때만) ──
+  // ── 데이터 변경 시 자동 Push (1.5초 디바운스, 로컬 변경 있을 때만) ──
   useEffect(()=>{
     if(!dbReady) return;
     if(!localDirtyRef.current) return; // ← 원격에서 당겨온 변경은 다시 올리지 않음 (cascade 방지)
     clearTimeout(syncPushTimer.current);
-    syncPushTimer.current=setTimeout(async()=>{
-      if(!localDirtyRef.current) return;
-      setSyncStatus("syncing");
-      try{
-        const { entries: e, cats: c, contacts: con } = dataRef.current;
-        await sbPush(e,c,con);
-        localDirtyRef.current = false;
-        setSyncStatus("ok");
-      }catch(e){ console.error("Supabase push",e); setSyncStatus("error"); }
-    },3000);
-  },[entries,cats,contacts,dbReady]);
+    syncPushTimer.current=setTimeout(()=>{ flushPush(); }, 1500);
+  },[entries,cats,contacts,dbReady,flushPush]);
 
   // ── 항목 CRUD ────────────────────────────────────────
   const openNew  = ()  => setModal({entry:null});
@@ -1262,33 +1401,36 @@ function App() {
 
   // ── Supabase 수동 동기화 ─────────────────────────────
   async function manualSync(){
-    setSyncStatus("syncing");
+    if(!navigator.onLine){ setSyncStatus("offline"); alert("오프라인 상태입니다. 네트워크 연결 후 다시 시도하세요."); return; }
     try{
-      const remote=await sbPull();
-      const {entries:curE,cats:curC,contacts:curCon}=dataRef.current;
-      let finalEntries=curE,finalCats=curC,finalContacts=curCon;
-      if(remote){
-        if(remote.entries){
-          const lMap=Object.fromEntries(curE.map(e=>[e.id,e]));
-          const rMap=Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
-          const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
-          finalEntries=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return migrateEntry(r); if(!r)return migrateEntry(l); return migrateEntry(l.updatedAt>=r.updatedAt?l:r); });
-          setEntries(finalEntries.sort((a,b)=>b.createdAt-a.createdAt));
+      await withSyncLock(async ()=>{
+        setSyncStatus("syncing");
+        const remote=await withRetry(sbPull);
+        const {entries:curE,cats:curC,contacts:curCon}=dataRef.current;
+        let finalEntries=curE,finalCats=curC,finalContacts=curCon;
+        if(remote){
+          if(remote.entries){
+            const lMap=Object.fromEntries(curE.map(e=>[e.id,e]));
+            const rMap=Object.fromEntries((remote.entries||[]).map(e=>[e.id,e]));
+            const ids=new Set([...Object.keys(lMap),...Object.keys(rMap)]);
+            finalEntries=Array.from(ids).map(id=>{ const l=lMap[id],r=rMap[id]; if(!l)return migrateEntry(r); if(!r)return migrateEntry(l); return migrateEntry((l.updatedAt||0)>=(r.updatedAt||0)?l:r); });
+            setEntries(finalEntries.sort((a,b)=>b.createdAt-a.createdAt));
+          }
+          if(remote.cats?.length){ finalCats=remote.cats; setCats(remote.cats); }
+          if(remote.contacts?.length){
+            const lCMap=Object.fromEntries(curCon.map(c=>[c.id,c]));
+            const rCMap=Object.fromEntries(remote.contacts.map(c=>[c.id,c]));
+            const cIds=new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
+            finalContacts=Array.from(cIds).map(id=>rCMap[id]||lCMap[id]);
+            setContacts(finalContacts);
+          }
         }
-        if(remote.cats?.length){ finalCats=remote.cats; setCats(remote.cats); }
-        if(remote.contacts?.length){
-          const lCMap=Object.fromEntries(curCon.map(c=>[c.id,c]));
-          const rCMap=Object.fromEntries(remote.contacts.map(c=>[c.id,c]));
-          const cIds=new Set([...Object.keys(lCMap),...Object.keys(rCMap)]);
-          finalContacts=Array.from(cIds).map(id=>rCMap[id]||lCMap[id]);
-          setContacts(finalContacts);
-        }
-      }
-      await sbPush(finalEntries,finalCats,finalContacts);
-      localDirtyRef.current=false;
-      setSyncStatus("ok");
+        await withRetry(()=>sbPush(finalEntries,finalCats,finalContacts));
+        localDirtyRef.current=false;
+        setSyncStatus("ok");
+      });
       alert("동기화 완료!");
-    }catch(e){ console.error("manual sync",e); setSyncStatus("error"); alert("동기화 오류: "+e.message); }
+    }catch(e){ console.error("manual sync",e); setSyncStatus(navigator.onLine?"error":"offline"); alert("동기화 오류: "+(e&&e.message?e.message:e)); }
   }
 
   // ── 분류 저장 ────────────────────────────────────────
@@ -1305,20 +1447,23 @@ function App() {
     setContacts(next);
   }
 
-  // 담당자 탭 저장 버튼 — 즉시 Supabase push (3초 대기 없음)
+  // 담당자 탭 저장 버튼 — 즉시 Supabase push (디바운스 없음)
   async function forceSaveContacts(nextContacts) {
     localDirtyRef.current = true;
     dataRef.current = {...dataRef.current, contacts: nextContacts}; // pull 경쟁 방지
     setContacts(nextContacts);
-    setSyncStatus("syncing");
+    if(!navigator.onLine){ setSyncStatus("offline"); throw new Error("오프라인 상태입니다."); }
     try {
-      const { entries: e, cats: c } = dataRef.current;
-      await sbPush(e, c, nextContacts);
-      localDirtyRef.current = false;
-      setSyncStatus("ok");
+      await withSyncLock(async ()=>{
+        setSyncStatus("syncing");
+        const { entries: e, cats: c } = dataRef.current;
+        await withRetry(()=>sbPush(e, c, nextContacts));
+        localDirtyRef.current = false;
+        setSyncStatus("ok");
+      });
     } catch(err) {
       console.error("forceSave", err);
-      setSyncStatus("error");
+      setSyncStatus(navigator.onLine ? "error" : "offline");
       throw err; // SaveBtn이 ⚠ 오류 표시할 수 있도록 re-throw
     }
   }
@@ -1372,16 +1517,16 @@ function App() {
           <span style={{fontSize:11,color:"#aaa"}}>{totalActive}건</span>
           <button
             onClick={manualSync}
-            title={syncStatus==="error"?"동기화 오류 — 클릭하여 재시도":"지금 동기화"}
+            title={syncStatus==="error"?"동기화 오류 — 클릭하여 재시도":syncStatus==="offline"?"오프라인 — 연결되면 자동 동기화":"지금 동기화"}
             style={{padding:"7px 10px",background:syncStatus==="error"?"rgba(231,76,60,0.2)":"transparent",
               border:"1px solid "+(syncStatus==="error"?"#e74c3c":"rgba(255,255,255,0.25)"),
               borderRadius:7,fontSize:12,cursor:"pointer",
-              color:syncStatus==="error"?"#e74c3c":syncStatus==="syncing"?"#f1c40f":"#2ecc71",
+              color:syncStatus==="error"?"#e74c3c":syncStatus==="syncing"?"#f1c40f":syncStatus==="offline"?"#95a5a6":"#2ecc71",
               display:"flex",alignItems:"center",gap:4}}>
             <span style={{display:"inline-block",animation:syncStatus==="syncing"?"spin 1s linear infinite":"none"}}>
-              {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":syncStatus==="error"?"⚠":"☁"}
+              {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":syncStatus==="error"?"⚠":syncStatus==="offline"?"⚡":"☁"}
             </span>
-            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":"동기화"}</span>
+            <span style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":syncStatus==="offline"?"오프라인":"동기화"}</span>
           </button>
           <button onClick={()=>exportXLSX(entries,cats,contacts)} style={{padding:"7px 10px",background:"#27ae60",color:"#fff",border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer"}}>📊 엑셀</button>
           <button onClick={openNew} style={{padding:"7px 12px",background:"#e74c3c",color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
