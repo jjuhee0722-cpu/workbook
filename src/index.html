@@ -1,0 +1,1756 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="업무수첩"/>
+  <title>📋 업무수첩</title>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+KR:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { font-family: 'Noto Sans KR', 'Apple SD Gothic Neo', sans-serif; background: #f2f2ef; -webkit-font-smoothing: antialiased; }
+    input, textarea, select, button { font-family: inherit; }
+    input[type=date] { -webkit-appearance: none; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .app-title, .header-action, .sync-label { white-space: nowrap; }
+    @media (max-width: 480px) {
+      .app-header { padding: 0 8px !important; }
+      .app-header-left, .app-header-actions { gap: 5px !important; }
+      .app-title { font-size: 14px !important; }
+      .header-count, .sync-label { display: none !important; }
+      .header-action { padding: 7px 8px !important; font-size: 11px !important; }
+    }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://cdn.sheetjs.com/xlsx-0.20.2/package/dist/xlsx.full.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+const XLSX_LIB = window.XLSX;
+
+// ══════════════════════════════════════════════════════════
+//  IndexedDB 레이어 — 캐시/쿠키 삭제에도 데이터 보존
+// ══════════════════════════════════════════════════════════
+const DB_NAME    = "workbook_db";
+const DB_VERSION = 1;
+const STORES     = { entries: "entries", cats: "cats", contacts: "contacts", meta: "meta" };
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = e => {
+      const db = e.target.result;
+      Object.values(STORES).forEach(name => {
+        if (!db.objectStoreNames.contains(name)) db.createObjectStore(name, { keyPath: "id" });
+      });
+    };
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbGetAll(store) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(store, "readonly");
+    const req = tx.objectStore(store).getAll();
+    req.onsuccess = e => resolve(e.target.result);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbPut(store, obj) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(store, "readwrite");
+    const req = tx.objectStore(store).put(obj);
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbDelete(store, id) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(store, "readwrite");
+    const req = tx.objectStore(store).delete(id);
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbClear(store) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(store, "readwrite");
+    const req = tx.objectStore(store).clear();
+    req.onsuccess = () => resolve();
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+
+async function idbReplaceAll(store, items) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, "readwrite");
+    const objectStore = tx.objectStore(store);
+    objectStore.clear();
+    items.forEach(item => objectStore.put(item));
+    tx.oncomplete = () => { db.close(); resolve(); };
+    tx.onerror = () => { db.close(); reject(tx.error); };
+    tx.onabort = () => { db.close(); reject(tx.error || new Error("IndexedDB transaction aborted")); };
+  });
+}
+
+// meta 단건 (cats 등 배열 통째로 저장)
+async function idbGetMeta(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx  = db.transaction(STORES.meta, "readonly");
+    const req = tx.objectStore(STORES.meta).get(key);
+    req.onsuccess = e => resolve(e.target.result?.value ?? null);
+    req.onerror   = e => reject(e.target.error);
+  });
+}
+async function idbSetMeta(key, value) {
+  await idbPut(STORES.meta, { id: key, value });
+}
+
+// ══════════════════════════════════════════════════════════
+//  Supabase 동기화 레이어
+// ══════════════════════════════════════════════════════════
+const SB_URL = "https://qroxbykatxpqvvgaftom.supabase.co";
+const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFyb3hieWthdHhwcXZ2Z2FmdG9tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzODI1NjUsImV4cCI6MjA5NDk1ODU2NX0.wGtQyS234I4TJRBycakvPdfXRySQite7w2OQ9TytoGE";
+const sb = (() => {
+  try {
+    if (!window.supabase || !window.supabase.createClient) return null;
+    return window.supabase.createClient(SB_URL, SB_KEY);
+  } catch (e) {
+    console.warn("[sync] Supabase 초기화 실패. 로컬 모드로 실행합니다.", e && e.message);
+    return null;
+  }
+})();
+
+// ── 비밀번호 잠금 상수 ──
+const PW_KEY     = 'wb_lock_pw';
+const PW_SESSION = 'wb_session_ok';
+const LS = (() => { try { return window.localStorage; } catch { return null; } })();
+const SS = (() => { try { return window.sessionStorage; } catch { return null; } })();
+
+function storageGet(store, key) {
+  try { return store && store.getItem(key); }
+  catch { return null; }
+}
+function storageSet(store, key, value) {
+  try { store && store.setItem(key, value); return true; }
+  catch { return false; }
+}
+function storageRemove(store, key) {
+  try { store && store.removeItem(key); return true; }
+  catch { return false; }
+}
+
+async function hashPassword(value) {
+  const bytes=new TextEncoder().encode(value);
+  const digest=await crypto.subtle.digest("SHA-256",bytes);
+  return "sha256:"+Array.from(new Uint8Array(digest)).map(byte=>byte.toString(16).padStart(2,"0")).join("");
+}
+
+async function verifyPassword(input, stored) {
+  if(!stored) return false;
+  if(stored.startsWith("sha256:")) return (await hashPassword(input))===stored;
+  if(input!==stored) return false;
+  storageSet(LS,PW_KEY,await hashPassword(input));
+  return true;
+}
+
+// 직렬화 잠금 — pull/push가 동시에 겹쳐 서로 덮어쓰는 경쟁(race) 방지
+let _syncChain = Promise.resolve();
+function withSyncLock(fn) {
+  const run = _syncChain.then(fn, fn);   // 이전 작업의 성공/실패와 무관하게 순차 실행
+  _syncChain = run.catch(() => {});      // 한 번 실패해도 체인이 막히지 않도록
+  return run;
+}
+
+// 일시적 네트워크 오류 자동 재시도 (지수 백오프). 인증/권한 오류는 재시도하지 않음.
+async function withRetry(fn, { tries = 3, base = 600 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      lastErr = e;
+      const code = e && (e.code || e.status);
+      if (code === 401 || code === 403 || code === 'PGRST301') break; // 권한 문제는 즉시 중단
+      if (i < tries - 1) await new Promise(r => setTimeout(r, base * Math.pow(2, i)));
+    }
+  }
+  throw lastErr;
+}
+
+// 우리가 마지막으로 기록한 synced_at 토큰 — 자기 자신이 만든 실시간 이벤트(메아리)를 무시하기 위함
+let _lastWriteToken = 0;
+
+async function sbPull() {
+  if (!sb) throw new Error("Supabase client unavailable");
+  // maybeSingle: 행이 없으면 에러 대신 null 반환 (첫 사용 대응)
+  const { data, error } = await sb.from("workbook_sync").select("*").eq("id", "main").maybeSingle();
+  if (error) throw error;
+  return data;
+}
+
+async function sbPush(entries, cats, contacts) {
+  if (!sb) throw new Error("Supabase client unavailable");
+  const token = Date.now();
+  const { error } = await sb.from("workbook_sync").upsert({
+    id: "main",
+    entries,
+    cats,
+    contacts,
+    synced_at: token,
+  });
+  if (error) throw error;
+  _lastWriteToken = token;   // 직후 들어올 자기 메아리 이벤트를 식별하는 데 사용
+  return token;
+}
+
+// 대략적인 페이로드 크기(바이트) — 사진·첨부 base64가 한도를 넘는지 점검
+function approxPayloadBytes(entries, cats, contacts) {
+  try { return new Blob([JSON.stringify({ entries, cats, contacts })]).size; }
+  catch { return 0; }
+}
+
+// ══════════════════════════════════════════════════════════
+//  상수
+// ══════════════════════════════════════════════════════════
+const DEFAULT_CATS = [
+  { id: "task",    label: "할 일",       icon: "◆", color: "#c0392b" },
+  { id: "agenda",  label: "안건",        icon: "▣", color: "#8e44ad" },
+  { id: "meeting", label: "회의",        icon: "◉", color: "#16a085" },
+  { id: "inquiry", label: "문의사항",    icon: "？", color: "#d35400" },
+  { id: "climate", label: "기후부 요청", icon: "✦", color: "#27ae60" },
+  { id: "boss",    label: "부장님 요청", icon: "★", color: "#e67e22" },
+];
+
+const ICON_OPTIONS  = ["◆","◇","▣","◉","？","✦","★","●","◎","▶","✔","☆","■","▲","◐"];
+const COLOR_PRESETS = ["#c0392b","#e74c3c","#d35400","#e67e22","#f1c40f","#27ae60","#16a085","#2980b9","#8e44ad","#7f8c8d","#1a1a2e"];
+const colorToBg     = c => c + "18";
+
+const PRIS      = [{ id:"high",label:"긴급",color:"#c0392b"},{id:"mid",label:"보통",color:"#e67e22"},{id:"low",label:"낮음",color:"#7f8c8d"}];
+// 하단 네비 탭
+const NAV_TABS = [
+  {id:"list",    label:"목록",    icon:"📋"},
+  {id:"date",    label:"날짜별",  icon:"📅"},
+  {id:"tag",     label:"태그별",  icon:"🏷️"},
+  {id:"paste",   label:"텍스트",  icon:"✏️"},
+  {id:"contact", label:"담당자",  icon:"👤"},
+];
+
+// ── 유틸 ─────────────────────────────────────────────────
+const pad      = n => String(n).padStart(2,"0");
+const todayStr = () => { const d=new Date(); return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`; };
+const fmtTs    = ts => { const d=new Date(ts); return `${d.getFullYear()}.${pad(d.getMonth()+1)}.${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+const uid      = () => Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+
+function fileToB64(file) {
+  return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res(e.target.result); r.onerror=rej; r.readAsDataURL(file); });
+}
+function fileToAttachment(file) {
+  return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res({name:file.name,type:file.type,size:file.size,data:e.target.result}); r.onerror=rej; r.readAsDataURL(file); });
+}
+
+// ── Supabase Storage 업로드 ───────────────────────────────
+// 사진·첨부를 한 행에 base64로 욱여넣지 않고 Storage 버킷에 올린 뒤 URL만 저장(정석).
+// 버킷 미설정 등으로 업로드 실패 시 base64로 자동 폴백 → 앱은 절대 멈추지 않음.
+const SB_BUCKET = "workbook";
+async function sbUpload(file) {
+  if (!sb) throw new Error("Supabase client unavailable");
+  const safe = (file.name||"file").replace(/[^\w.\-]/g,"_").slice(-40);
+  const path = `${Date.now()}_${Math.random().toString(36).slice(2,8)}_${safe}`;
+  const { error } = await sb.storage.from(SB_BUCKET).upload(path, file, {
+    cacheControl: "31536000", upsert: false, contentType: file.type || undefined,
+  });
+  if (error) throw error;
+  const { data } = sb.storage.from(SB_BUCKET).getPublicUrl(path);
+  return { url: data.publicUrl, path };
+}
+// 사진 1장 → URL 문자열 (실패 시 base64 data URL)
+async function uploadPhoto(file) {
+  try { const { url } = await sbUpload(file); return url; }
+  catch (e) { console.warn("[storage] 사진 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToB64(file); }
+}
+// 첨부 1개 → {name,type,size,url} (실패 시 base64 data 보유 객체)
+async function uploadAttachment(file) {
+  try { const { url } = await sbUpload(file); return { name:file.name, type:file.type, size:file.size, url }; }
+  catch (e) { console.warn("[storage] 첨부 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToAttachment(file); }
+}
+// 첨부/사진 소스 추출 (신규 url 우선, 구버전 base64 호환)
+const attSrc = a => a && (a.url || a.data) || "";
+
+function fmtSize(b){ return b<1024?b+"B":b<1048576?(b/1024).toFixed(1)+"KB":(b/1048576).toFixed(1)+"MB"; }
+function attachIcon(t){
+  if(!t) return "📎";
+  if(t.includes("pdf")) return "📄";
+  if(t.includes("word")||t.includes("document")) return "📝";
+  if(t.includes("sheet")||t.includes("excel")||t.includes("spreadsheet")) return "📊";
+  if(t.includes("presentation")||t.includes("powerpoint")) return "📑";
+  if(t.includes("text")) return "📃";
+  if(t.includes("zip")||t.includes("archive")||t.includes("compressed")) return "🗜️";
+  return "📎";
+}
+// 구 버전(photo 단일) → 신 버전(photos 배열) 마이그레이션
+const migrateEntry = e=>({
+  ...e,
+  updatedAt:Number(e.updatedAt||e.createdAt||0),
+  deletedAt:Number(e.deletedAt||0),
+  photos:e.photos||(e.photo?[e.photo]:[]),
+  attachments:e.attachments||[],
+});
+const migrateContact = c=>({
+  ...c,
+  updatedAt:Number(c.updatedAt||c.createdAt||0),
+  deletedAt:Number(c.deletedAt||0),
+  photos:c.photos||(c.photo?[c.photo]:[]),
+});
+const isLiveRecord = record => !record.deletedAt;
+const recordVersion = record => Math.max(Number(record?.updatedAt||0),Number(record?.deletedAt||0));
+
+function mergeRecords(local, remote, migrate, preferLocalOrder=true) {
+  const l=(local||[]).map(migrate), r=(remote||[]).map(migrate);
+  const lMap=new Map(l.map(item=>[item.id,item]));
+  const rMap=new Map(r.map(item=>[item.id,item]));
+  const primary=preferLocalOrder?l:r;
+  const secondary=preferLocalOrder?r:l;
+  const ids=[...primary.map(item=>item.id),...secondary.map(item=>item.id)]
+    .filter((id,index,all)=>id&&all.indexOf(id)===index);
+  return ids.map(id=>{
+    const left=lMap.get(id), right=rMap.get(id);
+    if(!left) return right;
+    if(!right) return left;
+    const lv=recordVersion(left), rv=recordVersion(right);
+    if(lv===rv) return preferLocalOrder?left:right;
+    return lv>rv?left:right;
+  });
+}
+
+function sameRecords(a,b,migrate) {
+  const normalize=list=>(list||[]).map(migrate).sort((x,y)=>String(x.id).localeCompare(String(y.id)));
+  return JSON.stringify(normalize(a))===JSON.stringify(normalize(b));
+}
+function getDday(dl) {
+  if(!dl) return null;
+  const t=new Date(); t.setHours(0,0,0,0);
+  const d=new Date(dl); d.setHours(0,0,0,0);
+  const diff=Math.round((d-t)/86400000);
+  if(diff===0) return {label:"D-Day",color:"#c0392b"};
+  if(diff>0)   return {label:"D-"+diff, color:diff<=3?"#e67e22":"#2980b9"};
+  return {label:"D+"+Math.abs(diff)+" 초과",color:"#aaa"};
+}
+
+// ── 엑셀 ─────────────────────────────────────────────────
+function exportXLSX(entries, cats, contacts) {
+  const getCat = id => cats.find(c=>c.id===id)||{label:id};
+  const getPri = id => PRIS.find(p=>p.id===id)||PRIS[1];
+  const wb = XLSX_LIB.utils.book_new();
+  // 항목 시트
+  const eRows = entries.map(e=>({
+    분류:getCat(e.category).label, 우선순위:getPri(e.priority).label,
+    날짜:e.date, 마감기한:e.deadline||"", 제목:e.title, 내용:e.body||"",
+    태그:(e.tags||[]).join(", "), 완료:e.done?"완료":"미완료",
+    등록일시:fmtTs(e.createdAt), 수정일시:fmtTs(e.updatedAt),
+  }));
+  const ws1 = XLSX_LIB.utils.json_to_sheet(eRows);
+  ws1["!cols"]=[14,9,12,12,30,40,20,7,18,18].map(w=>({wch:w}));
+  XLSX_LIB.utils.book_append_sheet(wb,ws1,"업무 항목");
+  // 담당자 시트
+  const cRows = contacts.map(c=>({ 회사:c.company||"", 직함:c.title||"", 성함:c.name||"", 업무:c.role||"", 연락처:c.phone||"", 이메일:c.email||"", 메모:c.memo||"" }));
+  const ws2 = XLSX_LIB.utils.json_to_sheet(cRows);
+  ws2["!cols"]=[18,14,12,20,16,24,30].map(w=>({wch:w}));
+  XLSX_LIB.utils.book_append_sheet(wb,ws2,"담당자");
+  XLSX_LIB.writeFile(wb,"업무수첩_"+todayStr()+".xlsx");
+}
+
+// ══════════════════════════════════════════════════════════
+//  공통 UI 컴포넌트
+// ══════════════════════════════════════════════════════════
+const Lbl = ({children}) => <div style={{fontSize:11,color:"#888",marginBottom:3}}>{children}</div>;
+
+function MobSelect({value,onChange,children,style}) {
+  return (
+    <select value={value} onChange={e=>onChange(e.target.value)}
+      style={{width:"100%",padding:"10px 8px",border:"1px solid #ddd",borderRadius:8,fontSize:14,background:"#fff",boxSizing:"border-box",...style}}>
+      {children}
+    </select>
+  );
+}
+
+function TagChip({tag,onRemove,onClick,active}) {
+  return (
+    <span onClick={onClick}
+      style={{display:"inline-flex",alignItems:"center",gap:3,background:active?"#1a1a2e":"#ececec",color:active?"#fff":"#555",borderRadius:12,padding:"3px 10px",fontSize:11,cursor:onClick||onRemove?"pointer":"default",fontWeight:active?700:400,userSelect:"none"}}>
+      #{tag}
+      {onRemove&&<span onClick={e=>{e.stopPropagation();onRemove();}} style={{marginLeft:2,opacity:0.6,lineHeight:1}}>✕</span>}
+    </span>
+  );
+}
+
+function CatBadge({id,cats}) {
+  const c=cats.find(x=>x.id===id)||cats[0]||{icon:"◆",label:id,color:"#888"};
+  return <span style={{fontSize:10,background:colorToBg(c.color),color:c.color,padding:"2px 8px",borderRadius:10,fontWeight:700,border:"1px solid "+c.color+"33",whiteSpace:"nowrap"}}>{c.icon} {c.label}</span>;
+}
+function PriBadge({id}) {
+  const p=PRIS.find(x=>x.id===id)||PRIS[1];
+  return <span style={{fontSize:10,color:p.color,fontWeight:700,whiteSpace:"nowrap"}}>● {p.label}</span>;
+}
+
+// ══════════════════════════════════════════════════════════
+//  항목 카드
+// ══════════════════════════════════════════════════════════
+function Card({entry,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
+  const cat  = cats.find(c=>c.id===entry.category)||cats[0]||{color:"#888"};
+  const dday = getDday(entry.deadline);
+  return (
+    <div style={{background:selected?"#eef4ff":entry.done?"#f7f7f5":"#fff",border:"1px solid "+(selected?"#2980b9":entry.done?"#e5e5e0":"#ddd"),borderLeft:"4px solid "+(selected?"#2980b9":entry.done?"#bbb":cat.color),borderRadius:10,padding:"12px 14px",display:"flex",alignItems:"flex-start",gap:10,transition:"background 0.15s"}}>
+
+      {/* 선택 체크박스 */}
+      <div onClick={()=>onSelect(entry.id)} style={{marginTop:3,flexShrink:0,width:22,height:22,borderRadius:6,border:"2px solid "+(selected?"#2980b9":entry.done?"#27ae60":"#ccc"),background:selected?"#2980b9":entry.done?"#27ae60":"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
+        {(selected||entry.done)&&<span style={{color:"#fff",fontSize:13,fontWeight:700}}>{selected?"✓":entry.done?"✓":""}</span>}
+      </div>
+
+      <div style={{flex:1,minWidth:0}}>
+        <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap",marginBottom:5}}>
+          <CatBadge id={entry.category} cats={cats}/>
+          {!entry.done&&<PriBadge id={entry.priority}/>}
+          {entry.date&&<span style={{fontSize:10,color:"#bbb"}}>{"📅 "+entry.date}</span>}
+          {entry.deadline&&!entry.done&&dday&&(
+            <span style={{fontSize:10,fontWeight:700,color:dday.color,background:dday.color+"22",padding:"2px 7px",borderRadius:8}}>{"🗓 "+entry.deadline+" ("+dday.label+")"}</span>
+          )}
+          {entry.done&&<span style={{fontSize:10,color:"#27ae60",fontWeight:700}}>✓ 완료</span>}
+        </div>
+        <div style={{fontSize:15,fontWeight:600,lineHeight:1.4,wordBreak:"break-word",color:entry.done?"#999":"#1a1a2e",textDecoration:entry.done?"line-through":"none"}}>{entry.title}</div>
+        {entry.body&&<div style={{fontSize:13,color:entry.done?"#bbb":"#666",marginTop:5,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.6}}>{entry.body}</div>}
+        <div style={{opacity:entry.done?0.5:1}}>
+          <PhotoGallery photos={entry.photos||(entry.photo?[entry.photo]:[])} />
+          <AttachList attachments={entry.attachments||[]}/>
+        </div>
+        {entry.tags&&entry.tags.length>0&&(
+          <div style={{display:"flex",gap:4,flexWrap:"wrap",marginTop:6,opacity:entry.done?0.5:1}}>
+            {entry.tags.map(t=><TagChip key={t} tag={t}/>)}
+          </div>
+        )}
+        <div style={{fontSize:10,color:"#ccc",marginTop:5}}>{fmtTs(entry.updatedAt)}</div>
+      </div>
+
+      <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
+        <button onClick={()=>onToggle(entry.id)} style={{padding:"5px 8px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444",minWidth:44}}>{entry.done?"↩":"완료"}</button>
+        <button onClick={()=>onEdit(entry)} style={{padding:"5px 8px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444",minWidth:44}}>수정</button>
+        <button onClick={()=>onDelete(entry.id)} style={{padding:"5px 8px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#c0392b",minWidth:44}}>삭제</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  선택 액션 바
+// ══════════════════════════════════════════════════════════
+function SelectionBar({selected,entries,cats,onClear,onMarkDone,onMarkUndone,onDelete,barRef}) {
+  const selEntries  = entries.filter(e=>selected.has(e.id));
+  const doneCount   = selEntries.filter(e=>e.done).length;
+  const undoneCount = selEntries.length - doneCount;
+  const catCounts   = {};
+  selEntries.forEach(e=>{ catCounts[e.category]=(catCounts[e.category]||0)+1; });
+  const catSummary  = Object.entries(catCounts).map(([id,cnt])=>{ const c=cats.find(x=>x.id===id)||{icon:"◆",label:id,color:"#888"}; return {c,cnt}; });
+
+  return (
+    <div ref={barRef} style={{background:"#1a1a2e",color:"#fff",padding:"8px 14px 10px",boxShadow:"0 3px 12px rgba(0,0,0,0.3)"}}>
+      {/* 선택 요약 */}
+      <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6}}>
+        <span style={{fontWeight:700,fontSize:13}}>{selected.size}개 선택됨</span>
+        <div style={{display:"flex",gap:4,flexWrap:"wrap"}}>
+          {catSummary.map(({c,cnt})=>(
+            <span key={c.id||c.label} style={{fontSize:10,background:colorToBg(c.color),color:c.color,padding:"2px 7px",borderRadius:10,fontWeight:700,border:"1px solid "+c.color+"44"}}>
+              {c.icon} {c.label} {cnt}
+            </span>
+          ))}
+        </div>
+      </div>
+      {/* 선택 항목 제목 */}
+      <div style={{fontSize:11,color:"#aaa",marginBottom:8,lineHeight:1.6,maxHeight:44,overflowY:"auto"}}>
+        {selEntries.map(e=>(
+          <span key={e.id} style={{display:"inline-block",background:"rgba(255,255,255,0.1)",borderRadius:5,padding:"1px 7px",margin:"2px 3px 2px 0"}}>
+            {e.title.length>18?e.title.slice(0,18)+"…":e.title}
+          </span>
+        ))}
+      </div>
+      {/* 액션 */}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        {undoneCount>0&&<button onClick={onMarkDone}   style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#27ae60",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>✓ 완료({undoneCount})</button>}
+        {doneCount>0  &&<button onClick={onMarkUndone} style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#e67e22",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>↩ 미완료({doneCount})</button>}
+        <button onClick={()=>{if(window.confirm(selected.size+"개를 삭제하시겠습니까?"))onDelete();}} style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#c0392b",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>🗑 삭제({selected.size})</button>
+        <button onClick={onClear} style={{padding:"6px 10px",border:"1px solid rgba(255,255,255,0.3)",borderRadius:7,background:"transparent",color:"#ccc",fontSize:12,cursor:"pointer"}}>해제</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  항목 입력 모달
+// ══════════════════════════════════════════════════════════
+function EntryModal({initial,cats,onSubmit,onCancel}) {
+  const [form,setForm]         = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[]), attachments:initial.attachments||[]});
+  const [tagInput,setTagInput] = useState("");
+  const [uploading,setUploading] = useState(false);
+  const photoRef = useRef(null);
+  const fileRef  = useRef(null);
+  const bodyRef  = useRef(null);
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
+  async function addFiles(files){ setUploading(true); try{ const atts=await Promise.all(Array.from(files).map(uploadAttachment)); setForm(p=>({...p,attachments:[...(p.attachments||[]),...atts]})); } finally{ setUploading(false); } }
+  const autoResize = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(120,el.scrollHeight)+"px"; };
+  useEffect(()=>{ autoResize(bodyRef.current); },[]);
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onCancel}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:"16px 16px 0 0",padding:"20px 18px 36px",width:"100%",maxWidth:600,maxHeight:"92vh",overflowY:"auto",boxSizing:"border-box"}}>
+        <div style={{width:40,height:4,background:"#ddd",borderRadius:2,margin:"0 auto 16px"}}/>
+        <div style={{fontWeight:700,fontSize:16,color:"#1a1a2e",marginBottom:16}}>{initial.id?"항목 수정":"새 항목 추가"}</div>
+
+        <Lbl>분류</Lbl>
+        <MobSelect value={form.category} onChange={v=>f("category",v)} style={{marginBottom:12}}>
+          {cats.map(c=><option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}
+        </MobSelect>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <div><Lbl>우선순위</Lbl><MobSelect value={form.priority} onChange={v=>f("priority",v)}>{PRIS.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}</MobSelect></div>
+          <div><Lbl>작성 날짜</Lbl><input type="date" value={form.date} onChange={e=>f("date",e.target.value)} style={{width:"100%",padding:"10px 8px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/></div>
+        </div>
+
+        <Lbl>🗓 마감기한 (선택)</Lbl>
+        <input type="date" value={form.deadline||""} onChange={e=>f("deadline",e.target.value)} style={{width:"100%",padding:"10px 8px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box",marginBottom:12}}/>
+
+        <Lbl>제목 *</Lbl>
+        <input value={form.title} onChange={e=>f("title",e.target.value)} placeholder="제목을 입력하세요"
+          style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:15,boxSizing:"border-box",marginBottom:12}}/>
+
+        <Lbl>내용</Lbl>
+        <textarea ref={bodyRef} value={form.body}
+          onChange={e=>{ f("body",e.target.value); autoResize(e.target); }}
+          placeholder="세부 내용..." rows={6}
+          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12,minHeight:120,lineHeight:1.7,overflow:"hidden"}}/>
+
+        <Lbl>📷 사진 (여러 장 가능)</Lbl>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
+          {(form.photos||[]).map((src,i)=>(
+            <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
+              <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+              <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
+                style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
+            </div>
+          ))}
+          <button onClick={()=>!uploading&&photoRef.current?.click()}
+            style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:uploading?"default":"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{uploading?<span style={{display:"inline-block",fontSize:18,animation:"spin 1s linear infinite"}}>⟳</span>:"＋"}</button>
+        </div>
+        <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
+
+        <Lbl>📎 파일 첨부 (선택)</Lbl>
+        {(form.attachments||[]).length>0&&(
+          <div style={{display:"flex",flexDirection:"column",gap:4,marginBottom:8}}>
+            {(form.attachments||[]).map((att,i)=>(
+              <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f5f5f5",borderRadius:7,padding:"6px 10px",border:"1px solid #eee"}}>
+                <span style={{fontSize:15,flexShrink:0}}>{attachIcon(att.type)}</span>
+                <span style={{flex:1,fontSize:12,color:"#444",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{att.name}</span>
+                {att.size&&<span style={{fontSize:11,color:"#aaa",flexShrink:0}}>{fmtSize(att.size)}</span>}
+                <button onClick={()=>f("attachments",(form.attachments||[]).filter((_,j)=>j!==i))}
+                  style={{background:"none",border:"none",color:"#c0392b",cursor:"pointer",fontSize:16,flexShrink:0,padding:"0 2px"}}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+        <button onClick={()=>!uploading&&fileRef.current?.click()} style={{width:"100%",padding:"10px",border:"2px dashed #ddd",borderRadius:8,background:"#fafafa",fontSize:13,cursor:uploading?"default":"pointer",color:"#888",marginBottom:12}}>{uploading?"⟳ 업로드 중…":"📎 파일 선택 (PDF·엑셀·Word 등)"}</button>
+        <input ref={fileRef} type="file" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addFiles(e.target.files);e.target.value="";}}/>
+
+
+        <Lbl>태그</Lbl>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:8}}>{(form.tags||[]).map(t=><TagChip key={t} tag={t} onRemove={()=>f("tags",form.tags.filter(x=>x!==t))}/>)}</div>
+        <div style={{display:"flex",gap:6,marginBottom:20}}>
+          <input value={tagInput} onChange={e=>setTagInput(e.target.value)} onKeyDown={e=>{if(e.key==="Enter"){e.preventDefault();addTag();}}} placeholder="#태그 입력 후 Enter" style={{flex:1,padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14}}/>
+          <button onClick={addTag} style={{padding:"10px 14px",border:"1px solid #ddd",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer"}}>추가</button>
+        </div>
+
+        <div style={{display:"flex",gap:10}}>
+          <button onClick={onCancel} style={{flex:1,padding:"13px",border:"1px solid #ddd",borderRadius:10,background:"#fff",fontSize:15,cursor:"pointer",color:"#555"}}>취소</button>
+          <button onClick={()=>{if(form.title.trim())onSubmit(form);}} style={{flex:2,padding:"13px",border:"none",borderRadius:10,background:"#1a1a2e",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>{initial.id?"수정 완료":"저장"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  분류 관리 모달
+// ══════════════════════════════════════════════════════════
+function CatManageModal({cats,onSave,onClose}) {
+  const [list,setList]       = useState(cats.map(c=>({...c})));
+  const [editing,setEditing] = useState(null);
+  const [newLabel,setNewLabel]= useState("");
+  const [newIcon,setNewIcon]  = useState("◆");
+  const [newColor,setNewColor]= useState("#2980b9");
+
+  const upd=(id,k,v)=>setList(p=>p.map(c=>c.id===id?{...c,[k]:v}:c));
+  const del=(id)=>{ if(list.length<=1){alert("최소 1개 필요");return;} if(!window.confirm("삭제 시 해당 분류 항목은 첫 번째 분류로 이동합니다."))return; setList(p=>p.filter(c=>c.id!==id)); };
+  const add=()=>{ if(!newLabel.trim())return; setList(p=>[...p,{id:uid(),label:newLabel.trim(),icon:newIcon,color:newColor}]); setNewLabel("");setNewIcon("◆");setNewColor("#2980b9"); };
+
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:400,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:"16px 16px 0 0",padding:"20px 18px 36px",width:"100%",maxWidth:560,maxHeight:"88vh",overflowY:"auto",boxSizing:"border-box"}}>
+        <div style={{width:40,height:4,background:"#ddd",borderRadius:2,margin:"0 auto 16px"}}/>
+        <div style={{fontWeight:700,fontSize:16,color:"#1a1a2e",marginBottom:16}}>분류 관리</div>
+
+        <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20}}>
+          {list.map(cat=>(
+            <div key={cat.id} style={{border:"1px solid #eee",borderRadius:10,padding:"10px 12px",borderLeft:"4px solid "+cat.color,background:colorToBg(cat.color)+"44"}}>
+              {editing===cat.id?(
+                <div>
+                  <div style={{marginBottom:8}}><Lbl>이름</Lbl><input value={cat.label} onChange={e=>upd(cat.id,"label",e.target.value)} style={{width:"100%",padding:"8px 10px",border:"1px solid #ddd",borderRadius:7,fontSize:14,boxSizing:"border-box"}}/></div>
+                  <div style={{marginBottom:8}}><Lbl>아이콘</Lbl><div style={{display:"flex",flexWrap:"wrap",gap:5}}>{ICON_OPTIONS.map(ic=><button key={ic} onClick={()=>upd(cat.id,"icon",ic)} style={{width:34,height:34,border:cat.icon===ic?"2px solid "+cat.color:"1px solid #ddd",borderRadius:7,background:cat.icon===ic?colorToBg(cat.color):"#fff",fontSize:16,cursor:"pointer"}}>{ic}</button>)}</div></div>
+                  <div style={{marginBottom:10}}><Lbl>색상</Lbl><div style={{display:"flex",gap:5,flexWrap:"wrap",alignItems:"center"}}>{COLOR_PRESETS.map(col=><div key={col} onClick={()=>upd(cat.id,"color",col)} style={{width:26,height:26,borderRadius:"50%",background:col,cursor:"pointer",border:cat.color===col?"3px solid #1a1a2e":"2px solid transparent"}}/>)}<input type="color" value={cat.color} onChange={e=>upd(cat.id,"color",e.target.value)} style={{width:26,height:26,border:"none",borderRadius:"50%",cursor:"pointer",padding:0}}/></div></div>
+                  <button onClick={()=>setEditing(null)} style={{padding:"7px 16px",border:"none",borderRadius:7,background:"#1a1a2e",color:"#fff",fontSize:13,fontWeight:700,cursor:"pointer"}}>완료</button>
+                </div>
+              ):(
+                <div style={{display:"flex",alignItems:"center",gap:10}}>
+                  <span style={{fontSize:18}}>{cat.icon}</span>
+                  <span style={{flex:1,fontSize:14,fontWeight:600,color:cat.color}}>{cat.label}</span>
+                  <button onClick={()=>setEditing(cat.id)} style={{padding:"5px 12px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:12,cursor:"pointer",color:"#444"}}>수정</button>
+                  <button onClick={()=>del(cat.id)} style={{padding:"5px 10px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:12,cursor:"pointer",color:"#c0392b"}}>삭제</button>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div style={{border:"1px dashed #ccc",borderRadius:10,padding:"14px"}}>
+          <div style={{fontWeight:700,fontSize:13,color:"#555",marginBottom:10}}>+ 새 분류 추가</div>
+          <Lbl>이름</Lbl>
+          <input value={newLabel} onChange={e=>setNewLabel(e.target.value)} placeholder="분류 이름" style={{width:"100%",padding:"9px 10px",border:"1px solid #ddd",borderRadius:7,fontSize:14,boxSizing:"border-box",marginBottom:10}}/>
+          <Lbl>아이콘</Lbl>
+          <div style={{display:"flex",flexWrap:"wrap",gap:5,marginBottom:10}}>{ICON_OPTIONS.map(ic=><button key={ic} onClick={()=>setNewIcon(ic)} style={{width:32,height:32,border:newIcon===ic?"2px solid #1a1a2e":"1px solid #ddd",borderRadius:7,background:newIcon===ic?"#e8e8f0":"#fff",fontSize:15,cursor:"pointer"}}>{ic}</button>)}</div>
+          <Lbl>색상</Lbl>
+          <div style={{display:"flex",gap:5,flexWrap:"wrap",alignItems:"center",marginBottom:14}}>{COLOR_PRESETS.map(col=><div key={col} onClick={()=>setNewColor(col)} style={{width:24,height:24,borderRadius:"50%",background:col,cursor:"pointer",border:newColor===col?"3px solid #1a1a2e":"2px solid transparent"}}/>)}<input type="color" value={newColor} onChange={e=>setNewColor(e.target.value)} style={{width:24,height:24,border:"none",borderRadius:"50%",cursor:"pointer",padding:0}}/></div>
+          <button onClick={add} disabled={!newLabel.trim()} style={{width:"100%",padding:"11px",border:"none",borderRadius:9,background:newLabel.trim()?"#1a1a2e":"#ccc",color:"#fff",fontSize:14,fontWeight:700,cursor:newLabel.trim()?"pointer":"not-allowed"}}>추가</button>
+        </div>
+
+        <div style={{display:"flex",gap:10,marginTop:18}}>
+          <button onClick={onClose} style={{flex:1,padding:"13px",border:"1px solid #ddd",borderRadius:10,background:"#fff",fontSize:15,cursor:"pointer",color:"#555"}}>취소</button>
+          <button onClick={()=>{onSave(list);onClose();}} style={{flex:2,padding:"13px",border:"none",borderRadius:10,background:"#27ae60",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>저장</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  담당자 연락처 탭
+// ══════════════════════════════════════════════════════════
+// 담당자 탭 전용 저장 버튼 (상태 피드백 포함)
+function SaveBtn({list, onForceSave}) {
+  const [st, setSt] = useState("idle"); // idle | saving | ok | error
+  async function handleSave() {
+    if(st==="saving") return;
+    setSt("saving");
+    try {
+      await onForceSave([...list]);
+      setSt("ok");
+    } catch(e) {
+      setSt("error");
+    }
+    setTimeout(()=>setSt("idle"), 2200);
+  }
+  const MAP = {
+    idle:   {label:"💾 저장",  bg:"#27ae60", disabled:false},
+    saving: {label:"저장 중…", bg:"#95a5a6", disabled:true},
+    ok:     {label:"✓ 저장됨", bg:"#2ecc71", disabled:true},
+    error:  {label:"⚠ 오류",   bg:"#e74c3c", disabled:false},
+  };
+  const m = MAP[st];
+  return (
+    <button onClick={handleSave} disabled={m.disabled}
+      style={{padding:"10px 13px",background:m.bg,color:"#fff",border:"none",borderRadius:8,
+        fontSize:13,fontWeight:700,cursor:m.disabled?"default":"pointer",
+        transition:"background 0.2s",whiteSpace:"nowrap",flexShrink:0}}>
+      {m.label}
+    </button>
+  );
+}
+
+function ContactTab({contacts,onSave,onForceSave}) {
+  const [list,setList]       = useState(contacts);
+  const [modal,setModal]     = useState(null);
+  const [search,setSearch]   = useState("");
+  const [dragIdx,setDragIdx] = useState(null);
+  const [overIdx,setOverIdx] = useState(null);
+  const cardRefs   = useRef([]);
+  const dragIdxRef = useRef(null);
+  const overIdxRef = useRef(null);
+
+  useEffect(()=>{ setList(contacts); },[contacts]);
+
+  const blank = ()=>({id:uid(),company:"",title:"",name:"",role:"",phone:"",email:"",memo:"",photos:[]});
+
+  function save(form) {
+    const next = modal.contact
+      ? list.map(c=>c.id===modal.contact.id?{...form,id:modal.contact.id}:c)
+      : [...list,{...form,id:uid()}];
+    setList(next); onSave(next); setModal(null);
+  }
+  function del(id) {
+    if(!window.confirm("삭제하시겠습니까?"))return;
+    const next=list.filter(c=>c.id!==id); setList(next); onSave(next);
+  }
+
+  const filtered = list.filter(c=>{
+    if(!search) return true;
+    const q=search.toLowerCase();
+    return [c.company,c.title,c.name,c.role,c.phone,c.email,c.memo].some(v=>(v||"").toLowerCase().includes(q));
+  });
+
+  // ── 드래그 앤 드롭 ──────────────────────────────────
+  // listRef: commitDrag 클로저 내에서 항상 최신 list를 읽기 위해 사용
+  const listRef = useRef(list);
+  useEffect(()=>{ listRef.current = list; }, [list]);
+
+  const lastYRef     = useRef(0);   // 마지막 포인터 Y (자동 스크롤 중 재평가용)
+  const scrollSpdRef = useRef(0);   // 자동 스크롤 속도(px/frame)
+  const rafRef       = useRef(null);
+
+  const canDrag    = !search;
+  const isDragging = dragIdx !== null;
+
+  // 포인터 Y에 해당하는 카드 인덱스. 카드 위가 아니면(간격·목록 밖) 가장 가까운/끝 카드로 보정.
+  function getCardAtY(y) {
+    const n = filtered.length;
+    let firstTop=Infinity, lastBottom=-Infinity, firstIdx=0, lastIdx=0;
+    let bestIdx=null, bestDist=Infinity;
+    for(let i=0;i<n;i++){
+      const el=cardRefs.current[i];
+      if(!el) continue;
+      const r=el.getBoundingClientRect();
+      if(r.top<firstTop){ firstTop=r.top; firstIdx=i; }
+      if(r.bottom>lastBottom){ lastBottom=r.bottom; lastIdx=i; }
+      if(y>=r.top && y<=r.bottom) return i;        // 카드 안 → 즉시 확정
+      const c=(r.top+r.bottom)/2, d=Math.abs(y-c); // 간격일 때 대비, 중심 최근접 후보
+      if(d<bestDist){ bestDist=d; bestIdx=i; }
+    }
+    if(bestIdx===null) return null;
+    if(y<firstTop) return firstIdx;                // 목록 위쪽 밖 → 맨 앞
+    if(y>lastBottom) return lastIdx;               // 목록 아래쪽 밖 → 맨 뒤
+    return bestIdx;                                // 카드 사이 간격 → 최근접 카드
+  }
+  function beginDrag(i){
+    dragIdxRef.current=i; overIdxRef.current=i;
+    setDragIdx(i); setOverIdx(i);
+  }
+  function updateDrag(clientY){
+    lastYRef.current=clientY;
+    const idx=getCardAtY(clientY);
+    if(idx!==null&&idx!==overIdxRef.current){ overIdxRef.current=idx; setOverIdx(idx); }
+    // 화면 위/아래 가장자리에 가까우면 자동 스크롤 속도 설정
+    const EDGE=90, MAX=18, h=window.innerHeight;
+    if(clientY<EDGE)            scrollSpdRef.current = -Math.ceil((EDGE-clientY)/EDGE*MAX);
+    else if(clientY>h-EDGE)     scrollSpdRef.current =  Math.ceil((clientY-(h-EDGE))/EDGE*MAX);
+    else                        scrollSpdRef.current = 0;
+  }
+  function commitDrag(){
+    const from=dragIdxRef.current, to=overIdxRef.current;
+    if(from!==null&&to!==null&&from!==to){
+      const arr=[...listRef.current];
+      const [item]=arr.splice(from,1);
+      arr.splice(to,0,item);
+      setList(arr); onSave(arr);
+    }
+    scrollSpdRef.current=0;
+    dragIdxRef.current=null; overIdxRef.current=null;
+    setDragIdx(null); setOverIdx(null);
+  }
+
+  // 드래그 중에만 document 레벨 이벤트 + 가장자리 자동 스크롤 루프 등록
+  // (touchmove에 passive:false 필수 — React 합성 이벤트로는 preventDefault 불가)
+  useEffect(()=>{
+    if(dragIdx===null) return;
+    const onMouseMove =(e)=>updateDrag(e.clientY);
+    const onMouseUp   =()=>commitDrag();
+    const onTouchMove =(e)=>{ e.preventDefault(); updateDrag(e.touches[0].clientY); };
+    const onTouchEnd  =()=>commitDrag();
+    document.addEventListener('mousemove',  onMouseMove);
+    document.addEventListener('mouseup',    onMouseUp);
+    document.addEventListener('touchmove',  onTouchMove,  {passive:false});
+    document.addEventListener('touchend',   onTouchEnd);
+    document.addEventListener('touchcancel',onTouchEnd);
+
+    let active=true;
+    const step=()=>{
+      if(!active) return;
+      const spd=scrollSpdRef.current;
+      if(spd!==0){
+        window.scrollBy(0,spd);
+        updateDrag(lastYRef.current); // 스크롤 후 포인터 아래 카드 다시 계산
+      }
+      rafRef.current=requestAnimationFrame(step);
+    };
+    rafRef.current=requestAnimationFrame(step);
+
+    return ()=>{
+      active=false;
+      if(rafRef.current) cancelAnimationFrame(rafRef.current);
+      scrollSpdRef.current=0;
+      document.removeEventListener('mousemove',  onMouseMove);
+      document.removeEventListener('mouseup',    onMouseUp);
+      document.removeEventListener('touchmove',  onTouchMove);
+      document.removeEventListener('touchend',   onTouchEnd);
+      document.removeEventListener('touchcancel',onTouchEnd);
+    };
+  },[dragIdx]);
+
+  return (
+    <div style={{paddingBottom:80}}>
+      <div style={{display:"flex",gap:8,marginBottom:10}}>
+        <div style={{flex:1,position:"relative"}}>
+          <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#aaa",fontSize:14,pointerEvents:"none"}}>🔍</span>
+          <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="검색..." style={{width:"100%",padding:"10px 10px 10px 34px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
+        </div>
+        <SaveBtn list={list} onForceSave={onForceSave}/>
+        <button onClick={()=>setModal({contact:null})} style={{padding:"10px 16px",background:"#1a1a2e",color:"#fff",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
+      </div>
+
+      {canDrag&&filtered.length>1&&(
+        <div style={{fontSize:11,color:"#bbb",marginBottom:10,textAlign:"center",letterSpacing:0.3}}>
+          ☰ 핸들을 드래그해서 순서 변경
+        </div>
+      )}
+
+      {filtered.length===0?(
+        <div style={{textAlign:"center",padding:"50px 0",color:"#bbb"}}>
+          <div style={{fontSize:40,marginBottom:10}}>👤</div>
+          <div style={{fontSize:14}}>담당자가 없습니다.</div>
+        </div>
+      ):(
+        <div style={{display:"flex",flexDirection:"column",gap:10,userSelect:isDragging?"none":"auto"}}>
+          {filtered.map((c,i)=>{
+            const isDragItem = dragIdx===i;
+            const isOver     = overIdx===i && !isDragItem;
+            return (
+              <div key={c.id}
+                ref={el=>{ cardRefs.current[i]=el; }}
+                style={{
+                  background: isOver?"#eef7ff": isDragItem?"#f7f7f5":"#fff",
+                  border:     isOver?"2px dashed #2980b9": isDragItem?"1px dashed #bbb":"1px solid #ddd",
+                  borderLeft: isDragItem?"4px solid #ccc":isOver?"4px solid #2980b9":"4px solid #2980b9",
+                  borderRadius:10, padding:"14px 14px",
+                  opacity:    isDragItem?0.5:1,
+                  transform:  isDragItem?"scale(1.015)":"none",
+                  boxShadow:  isDragItem?"0 8px 24px rgba(0,0,0,0.13)":"none",
+                  transition: isDragging?"opacity 0.1s,box-shadow 0.1s":"all 0.15s",
+                }}>
+                <div style={{display:"flex",alignItems:"flex-start",gap:10}}>
+
+                  {/* ── 드래그 핸들 ── */}
+                  {canDrag&&(
+                    <div
+                      onMouseDown={e=>{ e.preventDefault(); beginDrag(i); }}
+                      onTouchStart={()=>beginDrag(i)}
+                      style={{
+                        display:"flex",alignItems:"center",justifyContent:"center",
+                        flexShrink:0,width:36,alignSelf:"stretch",
+                        cursor:isDragItem?"grabbing":"grab",
+                        touchAction:"none",
+                        userSelect:"none",WebkitUserSelect:"none",
+                        color:isDragItem?"#2980b9":"#ccc",
+                        fontSize:20,letterSpacing:-1,
+                      }}>☰</div>
+                  )}
+
+                  <div style={{flex:1,minWidth:0,pointerEvents:isDragging?"none":"auto"}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap",marginBottom:6}}>
+                      {c.company&&<span style={{fontSize:11,background:"#e8f4fd",color:"#2980b9",padding:"2px 8px",borderRadius:8,fontWeight:700}}>🏢 {c.company}</span>}
+                      {c.title&&<span style={{fontSize:11,background:"#f0f0f0",color:"#555",padding:"2px 8px",borderRadius:8}}>{c.title}</span>}
+                    </div>
+                    <div style={{fontSize:16,fontWeight:700,color:"#1a1a2e",marginBottom:4}}>👤 {c.name||"(이름 없음)"}</div>
+                    {c.role&&<div style={{fontSize:13,color:"#555",marginBottom:4}}>💼 {c.role}</div>}
+                    <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                      {c.phone&&<a href={"tel:"+c.phone} style={{fontSize:13,color:"#2980b9",textDecoration:"none"}}>📞 {c.phone}</a>}
+                      {c.email&&<a href={"mailto:"+c.email} style={{fontSize:13,color:"#27ae60",textDecoration:"none"}}>✉️ {c.email}</a>}
+                    </div>
+                    {c.memo&&<div style={{fontSize:12,color:"#888",marginTop:6,whiteSpace:"pre-wrap"}}>{c.memo}</div>}
+                    <PhotoGallery photos={c.photos||(c.photo?[c.photo]:[])} thumbStyle={{width:80,height:80}}/>
+                  </div>
+
+                  <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0,pointerEvents:isDragging?"none":"auto"}}>
+                    <button onClick={()=>!isDragging&&setModal({contact:c})} style={{padding:"5px 10px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444"}}>수정</button>
+                    <button onClick={()=>!isDragging&&del(c.id)} style={{padding:"5px 10px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#c0392b"}}>삭제</button>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 담당자 입력 모달 */}
+      {modal&&(
+        <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={()=>setModal(null)}>
+          <div onClick={e=>e.stopPropagation()} style={{background:"#fff",borderRadius:"16px 16px 0 0",padding:"20px 18px 36px",width:"100%",maxWidth:560,maxHeight:"88vh",overflowY:"auto",boxSizing:"border-box"}}>
+            <div style={{width:40,height:4,background:"#ddd",borderRadius:2,margin:"0 auto 16px"}}/>
+            <ContactForm initial={modal.contact||blank()} onSubmit={save} onCancel={()=>setModal(null)}/>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ContactForm({initial,onSubmit,onCancel}) {
+  const [form,setForm] = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[])});
+  const [uploading,setUploading] = useState(false);
+  const photoRef = useRef(null);
+  const f=(k,v)=>setForm(p=>({...p,[k]:v}));
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
+  const fields=[
+    {key:"company",label:"🏢 회사",   placeholder:"소속 기관 / 회사명"},
+    {key:"title",  label:"🪪 직함",   placeholder:"직위 / 직책"},
+    {key:"name",   label:"👤 성함 *", placeholder:"담당자 이름"},
+    {key:"role",   label:"💼 업무",   placeholder:"담당 업무 내용"},
+    {key:"phone",  label:"📞 연락처", placeholder:"010-0000-0000"},
+    {key:"email",  label:"✉️ 이메일", placeholder:"example@example.com"},
+  ];
+  return (
+    <div>
+      <div style={{fontWeight:700,fontSize:16,color:"#1a1a2e",marginBottom:16}}>{initial.name?"담당자 수정":"담당자 추가"}</div>
+
+      {/* 명함 사진 */}
+      <Lbl>📇 명함 사진 (여러 장 가능)</Lbl>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14,alignItems:"flex-start"}}>
+        {(form.photos||[]).map((src,i)=>(
+          <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
+            <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+            <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
+              style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
+          </div>
+        ))}
+        <button onClick={()=>!uploading&&photoRef.current?.click()}
+          style={{width:72,height:72,border:"2px dashed #ccc",borderRadius:6,background:"#fafafa",fontSize:24,cursor:uploading?"default":"pointer",color:"#bbb",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{uploading?<span style={{display:"inline-block",fontSize:18,animation:"spin 1s linear infinite"}}>⟳</span>:"＋"}</button>
+      </div>
+      <input ref={photoRef} type="file" accept="image/*" multiple style={{display:"none"}} onChange={e=>{if(e.target.files.length)addPhotos(e.target.files);e.target.value="";}}/>
+
+
+      {fields.map(({key,label,placeholder})=>(
+        <div key={key} style={{marginBottom:12}}>
+          <Lbl>{label}</Lbl>
+          <input value={form[key]||""} onChange={e=>f(key,e.target.value)} placeholder={placeholder}
+            style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
+        </div>
+      ))}
+      <div style={{marginBottom:20}}>
+        <Lbl>📝 메모</Lbl>
+        <textarea value={form.memo||""} onChange={e=>f("memo",e.target.value)} placeholder="기타 메모..." rows={3}
+          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"vertical",boxSizing:"border-box",fontFamily:"inherit"}}/>
+      </div>
+      <div style={{display:"flex",gap:10}}>
+        <button onClick={onCancel} style={{flex:1,padding:"13px",border:"1px solid #ddd",borderRadius:10,background:"#fff",fontSize:15,cursor:"pointer",color:"#555"}}>취소</button>
+        <button onClick={()=>{if(form.name?.trim())onSubmit(form);else alert("성함을 입력해주세요.");}} style={{flex:2,padding:"13px",border:"none",borderRadius:10,background:"#1a1a2e",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>{initial.name?"수정 완료":"저장"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  날짜별 / 태그별 / 텍스트 입력 탭
+// ══════════════════════════════════════════════════════════
+function DateView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
+  const groups={};
+  entries.filter(e=>!e.done).forEach(e=>{const d=e.date||"날짜 없음";if(!groups[d])groups[d]=[];groups[d].push(e);});
+  const sorted=Object.entries(groups).sort((a,b)=>b[0].localeCompare(a[0]));
+  if(!sorted.length) return <Empty text="미완료 항목이 없습니다."/>;
+  return <div>{sorted.map(([date,items])=>(<div key={date} style={{marginBottom:22}}><div style={{fontSize:12,fontWeight:700,color:"#1a1a2e",background:"#e8e8f0",padding:"5px 12px",borderRadius:6,marginBottom:8,display:"inline-block"}}>{"📅 "+date+" ("+items.length+"건)"}</div><div style={{display:"flex",flexDirection:"column",gap:8}}>{items.map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={onSelect} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle}/>)}</div></div>))}</div>;
+}
+
+function TagView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
+  const [activeTag,setActiveTag]=useState(null);
+  const tagMap={};
+  entries.filter(e=>!e.done).forEach(e=>(e.tags||[]).forEach(t=>{if(!tagMap[t])tagMap[t]=[];tagMap[t].push(e);}));
+  const tags=Object.keys(tagMap).sort();
+  if(!tags.length) return <Empty text="태그가 없습니다."/>;
+  return (<div><div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:18}}>{tags.map(t=><TagChip key={t} tag={t+" ("+tagMap[t].length+")"} active={activeTag===t} onClick={()=>setActiveTag(activeTag===t?null:t)}/>)}</div>{activeTag&&(<div><div style={{fontSize:12,fontWeight:700,color:"#555",marginBottom:8}}>{"#"+activeTag+" — "+(tagMap[activeTag]||[]).length+"건"}</div><div style={{display:"flex",flexDirection:"column",gap:8}}>{(tagMap[activeTag]||[]).map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={onSelect} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle}/>)}</div></div>)}</div>);
+}
+
+function PasteTab({cats,onAddEntry}) {
+  const [pasteText,setPasteText] = useState("");
+  const [stage,setStage]         = useState("paste"); // "paste" | "assign"
+  const [title,setTitle]         = useState("");
+  const [body,setBody]           = useState("");
+  const [category,setCategory]   = useState(cats[0]?.id||"task");
+  const [priority,setPriority]   = useState("mid");
+  const [errMsg,setErrMsg]       = useState("");
+  const bodyRef2 = useRef(null);
+  const autoResize2 = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(100,el.scrollHeight)+"px"; };
+
+  function applyPaste(){
+    if(!pasteText.trim()){setErrMsg("텍스트를 입력해주세요.");return;}
+    const lines=pasteText.split("\n").map(l=>l.trim()).filter(l=>l);
+    setTitle(lines[0]||"");
+    setBody(lines.slice(1).join("\n"));
+    setCategory(cats[0]?.id||"task");
+    setPriority("mid");
+    setErrMsg("");
+    setStage("assign");
+  }
+  function save(){
+    if(!title.trim()){setErrMsg("제목을 입력해주세요.");return;}
+    onAddEntry({category,priority,title:title.trim(),body,date:todayStr(),deadline:"",tags:[],photos:[],attachments:[],done:false});
+    setPasteText("");setTitle("");setBody("");setErrMsg("");setStage("paste");
+    alert("저장되었습니다.");
+  }
+
+  return (
+    <div style={{paddingBottom:20}}>
+      <div style={{background:"#f0f6fb",border:"1px solid #c5dff5",borderRadius:10,padding:"14px 16px",marginBottom:18,fontSize:13,color:"#1a4a6e",lineHeight:1.8}}>
+        <div style={{fontWeight:700,marginBottom:4}}>📋 수첩 내용 빠르게 입력</div>
+        <div>① 수첩 사진을 Claude 채팅창에 보내면 텍스트를 추출해드립니다</div>
+        <div>② 추출된 텍스트를 아래에 붙여넣기</div>
+        <div>③ 첫 줄은 제목, 나머지는 내용으로 자동 분리</div>
+      </div>
+      {errMsg&&<div style={{background:"#fdf2f2",border:"1px solid #f5c6c6",borderRadius:8,padding:"10px 14px",marginBottom:14,fontSize:13,color:"#c0392b"}}>{"⚠️ "+errMsg}</div>}
+
+      {stage==="paste"&&(
+        <div>
+          <textarea value={pasteText} onChange={e=>setPasteText(e.target.value)}
+            placeholder={"텍스트를 붙여넣으세요.\n첫 줄 → 제목 / 나머지 줄 → 내용으로 자동 분리됩니다."} rows={9}
+            style={{width:"100%",padding:"14px",border:"1px solid #ddd",borderRadius:10,fontSize:14,boxSizing:"border-box",fontFamily:"inherit",resize:"vertical",lineHeight:1.8,color:"#222"}}/>
+          <button onClick={applyPaste} disabled={!pasteText.trim()}
+            style={{display:"block",width:"100%",marginTop:12,padding:"14px",background:pasteText.trim()?"#1a1a2e":"#ccc",color:"#fff",border:"none",borderRadius:10,fontSize:15,fontWeight:700,cursor:pasteText.trim()?"pointer":"not-allowed"}}>
+            → 분류 선택
+          </button>
+        </div>
+      )}
+
+      {stage==="assign"&&(
+        <div>
+          <Lbl>제목 *</Lbl>
+          <input value={title} onChange={e=>setTitle(e.target.value)} placeholder="제목"
+            style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:15,boxSizing:"border-box",marginBottom:12}}/>
+
+          <Lbl>내용</Lbl>
+          <textarea ref={bodyRef2} value={body}
+            onChange={e=>{ setBody(e.target.value); autoResize2(e.target); }}
+            placeholder="내용 (선택)" rows={5}
+            style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box",fontFamily:"inherit",resize:"none",lineHeight:1.7,marginBottom:12,minHeight:100,overflow:"hidden"}}/>
+
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:18}}>
+            <div><Lbl>분류</Lbl><MobSelect value={category} onChange={setCategory}>{cats.map(c=><option key={c.id} value={c.id}>{c.icon} {c.label}</option>)}</MobSelect></div>
+            <div><Lbl>우선순위</Lbl><MobSelect value={priority} onChange={setPriority}>{PRIS.map(p=><option key={p.id} value={p.id}>{p.label}</option>)}</MobSelect></div>
+          </div>
+
+          <div style={{display:"flex",gap:10}}>
+            <button onClick={()=>{setStage("paste");setErrMsg("");}}
+              style={{padding:"13px 18px",border:"1px solid #ddd",borderRadius:10,background:"#fff",fontSize:15,cursor:"pointer",color:"#555"}}>← 수정</button>
+            <button onClick={save}
+              style={{flex:1,padding:"13px",border:"none",borderRadius:10,background:"#27ae60",color:"#fff",fontSize:15,fontWeight:700,cursor:"pointer"}}>✅ 저장</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// ══════════════════════════════════════════════════════════
+//  사진 뷰어 (확대/축소 + 네비게이션 + 다운로드)
+// ══════════════════════════════════════════════════════════
+function PhotoViewer({photos, startIndex, onClose}) {
+  const [idx,   setIdx]   = useState(startIndex||0);
+  const [scale, setScale] = useState(1);
+  const pinchRef = useRef(null);
+
+  useEffect(()=>{ setScale(1); },[idx]);
+
+  const prev = e=>{ e.stopPropagation(); setIdx(i=>(i-1+photos.length)%photos.length); };
+  const next = e=>{ e.stopPropagation(); setIdx(i=>(i+1)%photos.length); };
+
+  function download(e) {
+    e.stopPropagation();
+    const src=photos[idx];
+    if(src.startsWith("data:")){
+      const ext=(src.match(/data:image\/(\w+)/)?.[1]||"jpeg").replace("jpeg","jpg");
+      const a=document.createElement("a"); a.href=src; a.download="사진_"+(idx+1)+"."+ext;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    } else {
+      window.open(src,"_blank","noopener");
+    }
+  }
+  function onWheel(e){ e.preventDefault(); setScale(s=>Math.max(0.5,Math.min(5,s*(e.deltaY<0?1.1:0.9)))); }
+  function onTouchStart(e){ if(e.touches.length===2) pinchRef.current=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY); }
+  function onTouchMove(e){
+    if(e.touches.length===2&&pinchRef.current){
+      e.preventDefault();
+      const d=Math.hypot(e.touches[0].clientX-e.touches[1].clientX,e.touches[0].clientY-e.touches[1].clientY);
+      setScale(s=>Math.max(0.5,Math.min(5,s*(d/pinchRef.current)))); pinchRef.current=d;
+    }
+  }
+  function onTouchEnd(){ pinchRef.current=null; }
+
+  const OB={padding:"9px 16px",border:"none",borderRadius:8,fontSize:13,fontWeight:700,cursor:"pointer",color:"#fff"};
+  return (
+    <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.92)",zIndex:600,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",touchAction:"none"}}
+      onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14,width:"100%",maxWidth:"95vw"}}>
+        {/* 이미지 */}
+        <div style={{overflow:"hidden",width:"95vw",maxHeight:"70vh",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:10}}
+          onWheel={onWheel} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+          <img src={photos[idx]} alt={"사진 "+(idx+1)}
+            style={{maxWidth:"95vw",maxHeight:"70vh",objectFit:"contain",borderRadius:8,display:"block",
+              transform:"scale("+scale+")",transformOrigin:"center",transition:"transform 0.05s",userSelect:"none",WebkitUserSelect:"none"}}/>
+        </div>
+        {/* 네비게이션 */}
+        {photos.length>1&&(
+          <div style={{display:"flex",alignItems:"center",gap:14}}>
+            <button onClick={prev} style={{...OB,background:"rgba(255,255,255,0.18)",fontSize:22,padding:"5px 18px"}}>‹</button>
+            <span style={{color:"#ccc",fontSize:13}}>{idx+1} / {photos.length}</span>
+            <button onClick={next} style={{...OB,background:"rgba(255,255,255,0.18)",fontSize:22,padding:"5px 18px"}}>›</button>
+          </div>
+        )}
+        {/* 줌 컨트롤 + 다운로드 + 닫기 */}
+        <div style={{display:"flex",gap:8,flexWrap:"wrap",justifyContent:"center"}}>
+          <button onClick={e=>{e.stopPropagation();setScale(s=>Math.min(5,+(s+0.25).toFixed(2)));}} style={{...OB,background:"rgba(255,255,255,0.2)"}}>＋ 확대</button>
+          <button onClick={e=>{e.stopPropagation();setScale(1);}} style={{...OB,background:"rgba(255,255,255,0.1)",fontWeight:400}}>{Math.round(scale*100)}%</button>
+          <button onClick={e=>{e.stopPropagation();setScale(s=>Math.max(0.5,+(s-0.25).toFixed(2)));}} style={{...OB,background:"rgba(255,255,255,0.2)"}}>－ 축소</button>
+          <button onClick={download} style={{...OB,background:"#27ae60"}}>⬇ 다운로드</button>
+          <button onClick={e=>{e.stopPropagation();onClose();}} style={{...OB,background:"rgba(255,255,255,0.15)"}}>✕ 닫기</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PhotoGallery({photos, thumbStyle}) {
+  const [viewIdx, setViewIdx] = useState(null);
+  if(!photos||!photos.length) return null;
+  return (
+    <>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
+        {photos.map((src,i)=>(
+          <img key={i} src={src} alt={"사진"+(i+1)}
+            style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #eee",cursor:"zoom-in",display:"block",...thumbStyle}}
+            onClick={()=>setViewIdx(i)}/>
+        ))}
+      </div>
+      {viewIdx!==null&&<PhotoViewer photos={photos} startIndex={viewIdx} onClose={()=>setViewIdx(null)}/>}
+    </>
+  );
+}
+
+function AttachList({attachments}) {
+  if(!attachments||!attachments.length) return null;
+  function download(att){
+    const src=attSrc(att); if(!src) return;
+    if(src.startsWith("data:")){ const a=document.createElement("a"); a.href=src; a.download=att.name; document.body.appendChild(a); a.click(); document.body.removeChild(a); }
+    else { window.open(src,"_blank","noopener"); }
+  }
+  return (
+    <div style={{marginTop:6,display:"flex",flexDirection:"column",gap:4}}>
+      {attachments.map((att,i)=>(
+        <div key={i} style={{display:"flex",alignItems:"center",gap:8,background:"#f5f5f5",borderRadius:7,padding:"6px 10px",border:"1px solid #eee"}}>
+          <span style={{fontSize:15,flexShrink:0}}>{attachIcon(att.type)}</span>
+          <span style={{flex:1,fontSize:12,color:"#444",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{att.name}</span>
+          {att.size&&<span style={{fontSize:11,color:"#aaa",flexShrink:0}}>{fmtSize(att.size)}</span>}
+          <button onClick={()=>download(att)} style={{padding:"4px 10px",background:"#2980b9",color:"#fff",border:"none",borderRadius:6,fontSize:11,cursor:"pointer",flexShrink:0}}>⬇</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const Empty=({text="항목이 없습니다."})=>(<div style={{textAlign:"center",padding:"50px 0",color:"#bbb"}}><div style={{fontSize:40,marginBottom:10}}>📝</div><div style={{fontSize:14}}>{text}</div></div>);
+
+// ══════════════════════════════════════════════════════════
+//  비밀번호 변경 모달
+// ══════════════════════════════════════════════════════════
+function PasswordModal({onClose}) {
+  const hasPw = !!storageGet(LS, PW_KEY);
+  const [cur,   setCur]   = useState('');
+  const [next1, setNext1] = useState('');
+  const [next2, setNext2] = useState('');
+  const [err,   setErr]   = useState('');
+
+  async function save() {
+    if(hasPw && !(await verifyPassword(cur,storageGet(LS,PW_KEY)))){setErr('현재 비밀번호가 틀렸습니다.');return;}
+    if(!next1){setErr('새 비밀번호를 입력해주세요.');return;}
+    if(next1 !== next2){setErr('비밀번호가 일치하지 않습니다.');return;}
+    storageSet(LS,PW_KEY,await hashPassword(next1));
+    alert('비밀번호가 변경되었습니다.');
+    onClose();
+  }
+  async function removePw() {
+    if(!window.confirm('비밀번호를 해제하시겠습니까?'))return;
+    if(hasPw && !(await verifyPassword(cur,storageGet(LS,PW_KEY)))){setErr('현재 비밀번호가 틀렸습니다.');return;}
+    storageRemove(LS, PW_KEY);
+    alert('비밀번호가 해제되었습니다.');
+    onClose();
+  }
+  const IS={width:'100%',padding:'12px 14px',border:'1px solid #ddd',borderRadius:9,fontSize:15,boxSizing:'border-box',marginBottom:10,fontFamily:'inherit'};
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.55)',zIndex:500,display:'flex',alignItems:'flex-end',justifyContent:'center'}} onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} style={{background:'#fff',borderRadius:'16px 16px 0 0',padding:'24px 20px 36px',width:'100%',maxWidth:480,boxSizing:'border-box'}}>
+        <div style={{width:40,height:4,background:'#ddd',borderRadius:2,margin:'0 auto 18px'}}/>
+        <div style={{fontWeight:700,fontSize:16,color:'#1a1a2e',marginBottom:18}}>🔑 비밀번호 {hasPw?'변경':'설정'}</div>
+        {err&&<div style={{background:'#fdf2f2',border:'1px solid #f5c6c6',borderRadius:8,padding:'10px 14px',marginBottom:14,fontSize:13,color:'#c0392b'}}>{err}</div>}
+        {hasPw&&<><div style={{fontSize:12,color:'#888',marginBottom:4}}>현재 비밀번호</div><input type="password" value={cur} onChange={e=>setCur(e.target.value)} placeholder="현재 비밀번호" style={IS} autoComplete="current-password"/></>}
+        <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호</div>
+        <input type="password" value={next1} onChange={e=>setNext1(e.target.value)} placeholder="새 비밀번호" style={IS} autoComplete="new-password"/>
+        <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호 확인</div>
+        <input type="password" value={next2} onChange={e=>setNext2(e.target.value)} onKeyDown={e=>e.key==='Enter'&&save()} placeholder="비밀번호 재입력" style={{...IS,marginBottom:16}} autoComplete="new-password"/>
+        <button onClick={save} style={{width:'100%',padding:'13px',border:'none',borderRadius:10,background:'#1a1a2e',color:'#fff',fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:8}}>저장</button>
+        {hasPw&&<button onClick={removePw} style={{width:'100%',padding:'11px',border:'1px solid #fcc',borderRadius:10,background:'#fff',color:'#c0392b',fontSize:14,cursor:'pointer',marginBottom:8}}>비밀번호 해제</button>}
+        <button onClick={onClose} style={{width:'100%',padding:'11px',border:'1px solid #ddd',borderRadius:10,background:'#fff',color:'#555',fontSize:14,cursor:'pointer'}}>취소</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  잠금 화면
+// ══════════════════════════════════════════════════════════
+function LockScreen({onUnlock}) {
+  const stored = storageGet(LS, PW_KEY);
+  const isSetup = !stored;
+  const [pw,    setPw]    = useState('');
+  const [pw2,   setPw2]   = useState('');
+  const [input, setInput] = useState('');
+  const [err,   setErr]   = useState('');
+  const [mode,  setMode]  = useState(isSetup?'setup':'lock');
+  const inputRef = useRef(null);
+
+  useEffect(()=>{ setTimeout(()=>inputRef.current?.focus(),100); },[mode]);
+
+  async function unlock(){
+    if(await verifyPassword(input,storageGet(LS,PW_KEY))){
+      storageSet(SS, PW_SESSION, '1'); onUnlock();
+    } else {
+      setErr('비밀번호가 틀렸습니다. 다시 입력해주세요.');
+      setInput(''); inputRef.current?.focus();
+    }
+  }
+  async function setup(){
+    if(!pw){setErr('비밀번호를 입력해주세요.');return;}
+    if(pw!==pw2){setErr('비밀번호가 일치하지 않습니다.');return;}
+    storageSet(LS,PW_KEY,await hashPassword(pw));
+    storageSet(SS, PW_SESSION, '1'); onUnlock();
+  }
+  function skip(){ storageSet(SS, PW_SESSION, '1'); onUnlock(); }
+
+  const IS={width:'100%',padding:'14px',border:'2px solid #e0e0e0',borderRadius:10,fontSize:20,textAlign:'center',letterSpacing:8,boxSizing:'border-box',marginBottom:12,fontFamily:'inherit',outline:'none'};
+  const IS2={...IS,letterSpacing:2,fontSize:15,textAlign:'left'};
+  const BTN={width:'100%',padding:'14px',border:'none',borderRadius:10,background:'#1a1a2e',color:'#fff',fontSize:15,fontWeight:700,cursor:'pointer',marginBottom:8};
+
+  return (
+    <div style={{position:'fixed',inset:0,background:'#1a1a2e',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:24,zIndex:999}}>
+      <div style={{background:'#fff',borderRadius:20,padding:'36px 28px',width:'100%',maxWidth:360,boxShadow:'0 20px 60px rgba(0,0,0,0.5)'}}>
+        <div style={{textAlign:'center',marginBottom:24}}>
+          <div style={{fontSize:48,marginBottom:10}}>🔒</div>
+          <div style={{fontSize:22,fontWeight:700,color:'#1a1a2e'}}>업무수첩</div>
+          <div style={{fontSize:13,color:'#aaa',marginTop:6}}>{mode==='setup'?'처음 사용하시는군요! 비밀번호를 설정해주세요':'비밀번호를 입력해주세요'}</div>
+        </div>
+        {err&&<div style={{background:'#fdf2f2',border:'1px solid #f5c6c6',borderRadius:8,padding:'10px 14px',marginBottom:14,fontSize:13,color:'#c0392b',textAlign:'center'}}>{err}</div>}
+
+        {mode==='lock'&&(
+          <>
+            <input ref={inputRef} type="password" value={input} onChange={e=>setInput(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&unlock()} placeholder="••••••" style={IS} autoComplete="current-password"/>
+            <button onClick={unlock} style={BTN}>잠금 해제</button>
+          </>
+        )}
+        {mode==='setup'&&(
+          <>
+            <div style={{fontSize:12,color:'#888',marginBottom:4}}>새 비밀번호</div>
+            <input ref={inputRef} type="password" value={pw} onChange={e=>setPw(e.target.value)}
+              placeholder="비밀번호 입력" style={IS2} autoComplete="new-password"/>
+            <div style={{fontSize:12,color:'#888',marginBottom:4}}>비밀번호 확인</div>
+            <input type="password" value={pw2} onChange={e=>setPw2(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&setup()}
+              placeholder="비밀번호 재입력" style={{...IS2,marginBottom:16}} autoComplete="new-password"/>
+            <button onClick={setup} style={BTN}>설정 완료</button>
+            <button onClick={skip} style={{...BTN,background:'transparent',color:'#aaa',border:'1px solid #e0e0e0',fontWeight:400}}>건너뛰기 (비밀번호 없이 사용)</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════
+//  메인 앱
+// ══════════════════════════════════════════════════════════
+function App() {
+  const [entries,    setEntries]    = useState([]);
+  const [cats,       setCats]       = useState(DEFAULT_CATS);
+  const [contacts,   setContacts]   = useState([]);
+  const [tab,        setTab]        = useState("list");  // list|date|tag|paste|contact
+  const [catFilter,  setCatFilter]  = useState("all");
+  const [search,     setSearch]     = useState("");
+  const [showDone,   setShowDone]   = useState(false);
+  const [sortBy,     setSortBy]     = useState("priority");
+  const [modal,      setModal]      = useState(null);
+  const [showSidebar,setShowSidebar]= useState(false);
+  const [showCatMgr, setShowCatMgr] = useState(false);
+  const [selected,   setSelected]   = useState(new Set()); // 선택된 항목 id
+  const [dbReady,    setDbReady]    = useState(false);
+  const [syncStatus, setSyncStatus] = useState("idle"); // idle|syncing|ok|error
+  const [unlocked,   setUnlocked]   = useState(()=>!!storageGet(SS, PW_SESSION)||!storageGet(LS, PW_KEY));
+  const [showPwModal,setShowPwModal]= useState(false);
+  const syncPushTimer  = useRef(null);
+  const localDirtyRef  = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
+
+  // ── IndexedDB 초기 로드 ──────────────────────────────
+  useEffect(()=>{
+    (async()=>{
+      try {
+        const [ents,savedCats,savedContacts]=await Promise.all([
+          idbGetAll(STORES.entries),
+          idbGetMeta("cats"),
+          idbGetAll(STORES.contacts),
+        ]);
+        if(ents.length) setEntries(ents.map(migrateEntry).sort((a,b)=>b.createdAt-a.createdAt));
+        if(savedCats)   setCats(savedCats);
+        if(savedContacts.length) setContacts(savedContacts.map(migrateContact));
+      } catch(e){ console.error("IDB load error",e); }
+      setDbReady(true);
+    })();
+  },[]);
+
+  // ── 변경 시 IndexedDB 저장 ───────────────────────────
+  useEffect(()=>{ if(!dbReady) return; idbReplaceAll(STORES.entries,entries).catch(e=>console.error("IDB entries save",e)); },[entries,dbReady]);
+  useEffect(()=>{ if(!dbReady) return; idbSetMeta("cats",cats).catch(e=>console.error("IDB cats save",e)); },[cats,dbReady]);
+  useEffect(()=>{ if(!dbReady) return; idbReplaceAll(STORES.contacts,contacts).catch(e=>console.error("IDB contacts save",e)); },[contacts,dbReady]);
+
+  // ── 최신 state를 ref로 유지 (stale closure 방지) ───────
+  const dataRef = useRef({ entries, cats, contacts });
+  useEffect(()=>{ dataRef.current = { entries, cats, contacts }; });
+
+  // ── Pull + 항목별 병합 함수 (잠금·재시도·오프라인 처리 포함) ──
+  const pullAndMerge = useCallback(async () => {
+    if(!navigator.onLine){ setSyncStatus("offline"); return false; }
+    return withSyncLock(async () => {
+      setSyncStatus("syncing");
+      try{
+        const remote = await withRetry(sbPull);
+        if(remote){
+          const { entries: curE, contacts: curCon } = dataRef.current;
+          const preferLocal=localDirtyRef.current;
+          const mergedEntries=mergeRecords(curE,remote.entries||[],migrateEntry,preferLocal)
+            .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+          const mergedContacts=mergeRecords(curCon,remote.contacts||[],migrateContact,preferLocal);
+          const needsPush=preferLocal
+            ||!sameRecords(mergedEntries,remote.entries||[],migrateEntry)
+            ||!sameRecords(mergedContacts,remote.contacts||[],migrateContact);
+
+          dataRef.current={
+            entries:mergedEntries,
+            cats:remote.cats?.length?remote.cats:dataRef.current.cats,
+            contacts:mergedContacts,
+          };
+          setEntries(mergedEntries);
+          setContacts(mergedContacts);
+          if(remote.cats?.length) setCats(remote.cats);
+          localDirtyRef.current=needsPush;
+        }
+        setSyncStatus("ok");
+        return true;
+      }catch(e){
+        console.error("Supabase pull",e);
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+        return false;
+      }
+    });
+  },[]);
+
+  // ── Push 실행 (잠금·재시도, 로컬 변경 있을 때만) ──────
+  const flushPush = useCallback(async () => {
+    if(!localDirtyRef.current) return;
+    if(!navigator.onLine){ setSyncStatus("offline"); return; }
+    return withSyncLock(async () => {
+      if(!localDirtyRef.current) return;
+      setSyncStatus("syncing");
+      try{
+        const { entries: e, cats: c, contacts: con } = dataRef.current;
+        const remote=await withRetry(sbPull);
+        const mergedEntries=mergeRecords(e,remote?.entries||[],migrateEntry,true)
+          .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+        const mergedContacts=mergeRecords(con,remote?.contacts||[],migrateContact,true);
+        const mergedCats=c?.length?c:(remote?.cats||DEFAULT_CATS);
+        const bytes = approxPayloadBytes(mergedEntries,mergedCats,mergedContacts);
+        if(bytes > 4*1024*1024) console.warn("[sync] 페이로드가 큽니다(", (bytes/1048576).toFixed(1),"MB). 사진/첨부가 많으면 동기화가 느려지거나 실패할 수 있습니다.");
+        await withRetry(()=>sbPush(mergedEntries,mergedCats,mergedContacts));
+        dataRef.current={entries:mergedEntries,cats:mergedCats,contacts:mergedContacts};
+        setEntries(mergedEntries);
+        setContacts(mergedContacts);
+        localDirtyRef.current = false;
+        setSyncStatus("ok");
+      }catch(err){
+        console.error("Supabase push",err);
+        setSyncStatus(navigator.onLine ? "error" : "offline");
+      }
+    });
+  },[]);
+
+  // ── 앱 시작 시 Pull ──────────────────────────────────
+  useEffect(()=>{
+    if(!dbReady) return;
+    pullAndMerge();
+  },[dbReady]);
+
+  // ── 탭/창 활성화 시 자동 Pull (기기 전환 대응) ────────
+  useEffect(()=>{
+    const handle=()=>{ if(!document.hidden) pullAndMerge(); };
+    document.addEventListener("visibilitychange", handle);
+    window.addEventListener("focus", handle);
+    return ()=>{
+      document.removeEventListener("visibilitychange", handle);
+      window.removeEventListener("focus", handle);
+    };
+  },[pullAndMerge]);
+
+  // ── 온라인/오프라인 전환 처리 ─────────────────────────
+  useEffect(()=>{
+    const onOnline  = ()=>{ if(localDirtyRef.current) flushPush(); else pullAndMerge(); };
+    const onOffline = ()=> setSyncStatus("offline");
+    window.addEventListener("online",  onOnline);
+    window.addEventListener("offline", onOffline);
+    if(!navigator.onLine) setSyncStatus("offline");
+    return ()=>{
+      window.removeEventListener("online",  onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  },[pullAndMerge, flushPush]);
+
+  // ── Supabase 실시간 구독 (자기 메아리는 무시) ────────
+  useEffect(()=>{
+    if(!dbReady) return;
+    if(!sb) return;
+    const channel = sb.channel("wb_changes")
+      .on("postgres_changes",{ event:"*", schema:"public", table:"workbook_sync" }, (payload)=>{
+        const incoming = payload && payload.new && payload.new.synced_at;
+        // 방금 내가 올린 변경이 되돌아온 것이면 무시 (불필요한 재-pull·경쟁 방지)
+        if(incoming && Number(incoming) === _lastWriteToken) return;
+        pullAndMerge();
+      })
+      .subscribe();
+    return ()=>{ sb.removeChannel(channel); };
+  },[dbReady, pullAndMerge]);
+
+  // ── 데이터 변경 시 자동 Push (1.5초 디바운스, 로컬 변경 있을 때만) ──
+  useEffect(()=>{
+    if(!dbReady) return;
+    if(!localDirtyRef.current) return; // ← 원격에서 당겨온 변경은 다시 올리지 않음 (cascade 방지)
+    clearTimeout(syncPushTimer.current);
+    syncPushTimer.current=setTimeout(()=>{ flushPush(); }, 1500);
+  },[entries,cats,contacts,dbReady,flushPush]);
+
+  // ── 항목 CRUD ────────────────────────────────────────
+  const openNew  = ()  => setModal({entry:null});
+  const openEdit = (e) => setModal({entry:e});
+  const closeModal=()  => setModal(null);
+
+  function submitForm(form) {
+    localDirtyRef.current = true;
+    const now=Date.now();
+    if(modal.entry) setEntries(p=>p.map(e=>e.id===modal.entry.id?{...form,id:modal.entry.id,createdAt:modal.entry.createdAt,updatedAt:now,deletedAt:0}:e));
+    else            setEntries(p=>[{...form,id:uid(),createdAt:now,updatedAt:now,deletedAt:0},...p]);
+    closeModal();
+  }
+  function deleteEntry(id){if(!window.confirm("삭제하시겠습니까?"))return;localDirtyRef.current=true;const now=Date.now();setEntries(p=>p.map(e=>e.id===id?{...e,deletedAt:now,updatedAt:now}:e));setSelected(s=>{const n=new Set(s);n.delete(id);return n;});}
+  function toggleDone(id){localDirtyRef.current=true;setEntries(p=>p.map(e=>e.id===id?{...e,done:!e.done,updatedAt:Date.now()}:e));}
+  function addEntry(form){localDirtyRef.current=true;const now=Date.now();setEntries(p=>[{...form,id:uid(),createdAt:now,updatedAt:now,deletedAt:0},...p]);}
+
+  // ── 선택 ─────────────────────────────────────────────
+  function toggleSelect(id){setSelected(s=>{const n=new Set(s);n.has(id)?n.delete(id):n.add(id);return n;});}
+  function markDone(val){localDirtyRef.current=true;setEntries(p=>p.map(e=>selected.has(e.id)?{...e,done:val,updatedAt:Date.now()}:e));setSelected(new Set());}
+  function deleteSelected(){localDirtyRef.current=true;const now=Date.now();setEntries(p=>p.map(e=>selected.has(e.id)?{...e,deletedAt:now,updatedAt:now}:e));setSelected(new Set());}
+
+  // ── Supabase 수동 동기화 ─────────────────────────────
+  async function manualSync(){
+    if(!navigator.onLine){ setSyncStatus("offline"); alert("오프라인 상태입니다. 네트워크 연결 후 다시 시도하세요."); return; }
+    try{
+      await withSyncLock(async ()=>{
+        setSyncStatus("syncing");
+        const remote=await withRetry(sbPull);
+        const {entries:curE,cats:curC,contacts:curCon}=dataRef.current;
+        const finalEntries=mergeRecords(curE,remote?.entries||[],migrateEntry,true)
+          .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+        const finalCats=curC?.length?curC:(remote?.cats||DEFAULT_CATS);
+        const finalContacts=mergeRecords(curCon,remote?.contacts||[],migrateContact,true);
+        dataRef.current={entries:finalEntries,cats:finalCats,contacts:finalContacts};
+        setEntries(finalEntries);
+        setCats(finalCats);
+        setContacts(finalContacts);
+        await withRetry(()=>sbPush(finalEntries,finalCats,finalContacts));
+        localDirtyRef.current=false;
+        setSyncStatus("ok");
+      });
+      alert("동기화 완료!");
+    }catch(e){ console.error("manual sync",e); setSyncStatus(navigator.onLine?"error":"offline"); alert("동기화 오류: "+(e&&e.message?e.message:e)); }
+  }
+
+  // ── 분류 저장 ────────────────────────────────────────
+  function saveCatsWithMigrate(newCats){
+    localDirtyRef.current=true;
+    const ids=new Set(newCats.map(c=>c.id));const fallback=newCats[0]?.id;
+    setEntries(p=>p.map(e=>ids.has(e.category)?e:{...e,category:fallback}));
+    setCats(newCats);
+  }
+  function prepareContactSnapshot(next) {
+    const previous=(dataRef.current.contacts||[]).map(migrateContact);
+    const previousMap=new Map(previous.map(contact=>[contact.id,contact]));
+    const nextIds=new Set(next.map(contact=>contact.id));
+    const now=Date.now();
+    const stripMeta=contact=>{
+      const {updatedAt,deletedAt,order,...value}=contact;
+      return value;
+    };
+    const live=next.map((contact,index)=>{
+      const old=previousMap.get(contact.id);
+      const changed=!old||old.deletedAt||old.order!==index
+        ||JSON.stringify(stripMeta(old))!==JSON.stringify(stripMeta(contact));
+      return {...contact,order:index,deletedAt:0,updatedAt:changed?now:recordVersion(old)};
+    });
+    const tombstones=previous
+      .filter(contact=>contact.deletedAt||!nextIds.has(contact.id))
+      .map(contact=>contact.deletedAt?contact:{...contact,deletedAt:now,updatedAt:now});
+    return [...live,...tombstones];
+  }
+
+  // 담당자 저장 — dirty 플래그 + dataRef 즉시 동기화 (stale closure 방지)
+  function saveContacts(next){
+    const snapshot=prepareContactSnapshot(next);
+    localDirtyRef.current = true;
+    dataRef.current = {...dataRef.current, contacts: snapshot};
+    setContacts(snapshot);
+  }
+
+  // 담당자 탭 저장 버튼 — 즉시 Supabase push (디바운스 없음)
+  async function forceSaveContacts(nextContacts) {
+    const snapshot=prepareContactSnapshot(nextContacts);
+    localDirtyRef.current = true;
+    dataRef.current = {...dataRef.current, contacts: snapshot}; // pull 경쟁 방지
+    setContacts(snapshot);
+    if(!navigator.onLine){ setSyncStatus("offline"); throw new Error("오프라인 상태입니다."); }
+    try {
+      await withSyncLock(async ()=>{
+        setSyncStatus("syncing");
+        const { entries: e, cats: c } = dataRef.current;
+        const remote=await withRetry(sbPull);
+        const mergedEntries=mergeRecords(e,remote?.entries||[],migrateEntry,true);
+        const mergedContacts=mergeRecords(snapshot,remote?.contacts||[],migrateContact,true);
+        await withRetry(()=>sbPush(mergedEntries, c, mergedContacts));
+        dataRef.current={entries:mergedEntries,cats:c,contacts:mergedContacts};
+        setEntries(mergedEntries);
+        setContacts(mergedContacts);
+        localDirtyRef.current = false;
+        setSyncStatus("ok");
+      });
+    } catch(err) {
+      console.error("forceSave", err);
+      setSyncStatus(navigator.onLine ? "error" : "offline");
+      throw err; // SaveBtn이 ⚠ 오류 표시할 수 있도록 re-throw
+    }
+  }
+
+  // ── 필터/정렬 ────────────────────────────────────────
+  const liveEntries=entries.filter(isLiveRecord);
+  const liveContacts=contacts.filter(isLiveRecord).sort((a,b)=>(a.order??Number.MAX_SAFE_INTEGER)-(b.order??Number.MAX_SAFE_INTEGER));
+  const counts={};
+  cats.forEach(c=>{counts[c.id]=liveEntries.filter(e=>e.category===c.id&&!e.done).length;});
+  const totalActive=liveEntries.filter(e=>!e.done).length;
+
+  const filtered=liveEntries.filter(e=>{
+    if(!showDone&&e.done) return false;
+    if(catFilter!=="all"&&e.category!==catFilter) return false;
+    if(search){const q=search.toLowerCase();return e.title.toLowerCase().includes(q)||(e.body||"").toLowerCase().includes(q)||(e.tags||[]).some(t=>t.toLowerCase().includes(q));}
+    return true;
+  }).sort((a,b)=>{
+    if(a.done!==b.done) return a.done?1:-1;
+    if(!a.done){
+      if(sortBy==="date_desc") return b.updatedAt-a.updatedAt;
+      if(sortBy==="date_asc")  return a.updatedAt-b.updatedAt;
+      // 마감기한 임박 우선 → 마감기한 없으면 뒤로
+      const aHas=!!a.deadline, bHas=!!b.deadline;
+      if(aHas&&bHas){ const dc=a.deadline.localeCompare(b.deadline); if(dc!==0) return dc; }
+      else if(aHas) return -1;
+      else if(bHas) return 1;
+      // 마감기한 같거나 둘 다 없으면 우선순위(긴급>보통>낮음)
+      const pd=["high","mid","low"].indexOf(a.priority)-["high","mid","low"].indexOf(b.priority);
+      if(pd!==0) return pd;
+      return b.updatedAt-a.updatedAt;
+    }
+    return b.updatedAt-a.updatedAt;
+  });
+
+  const blankForm=()=>({category:catFilter!=="all"?catFilter:(cats[0]?.id||"task"),title:"",body:"",priority:"mid",date:todayStr(),deadline:"",tags:[],photos:[],attachments:[],done:false});
+  const selActive = selected.size>0;
+  const selBarRef  = useRef(null);
+
+  if(!unlocked) return <LockScreen onUnlock={()=>setUnlocked(true)}/>;
+  if(!dbReady) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",fontSize:15,color:"#888"}}>불러오는 중...</div>;
+
+  return (
+    <div style={{fontFamily:"'Noto Sans KR','Apple SD Gothic Neo',sans-serif",minHeight:"100vh",background:"#f2f2ef",WebkitFontSmoothing:"antialiased"}}>
+
+      {/* 헤더 + 선택바 + 탭바 — 하나의 sticky 컨테이너로 묶어 높이 자동 계산 */}
+      <div style={{position:"sticky",top:0,zIndex:200}}>
+      <header className="app-header" style={{background:"#1a1a2e",color:"#fff",padding:"0 14px",height:54,display:"flex",alignItems:"center",justifyContent:"space-between",boxShadow:"0 2px 8px rgba(0,0,0,0.3)"}}>
+        <div className="app-header-left" style={{display:"flex",alignItems:"center",gap:8}}>
+          <button onClick={()=>setShowSidebar(s=>!s)} style={{background:"none",border:"none",color:"#fff",fontSize:20,cursor:"pointer",padding:"4px 6px",lineHeight:1}}>☰</button>
+          <span className="app-title" style={{fontSize:17,fontWeight:700}}>📋 업무수첩</span>
+        </div>
+        <div className="app-header-actions" style={{display:"flex",alignItems:"center",gap:8}}>
+          <span className="header-count" style={{fontSize:11,color:"#aaa"}}>{totalActive}건</span>
+          <button
+            className="header-action"
+            onClick={manualSync}
+            title={syncStatus==="error"?"동기화 오류 — 클릭하여 재시도":syncStatus==="offline"?"오프라인 — 연결되면 자동 동기화":"지금 동기화"}
+            style={{padding:"7px 10px",background:syncStatus==="error"?"rgba(231,76,60,0.2)":"transparent",
+              border:"1px solid "+(syncStatus==="error"?"#e74c3c":"rgba(255,255,255,0.25)"),
+              borderRadius:7,fontSize:12,cursor:"pointer",
+              color:syncStatus==="error"?"#e74c3c":syncStatus==="syncing"?"#f1c40f":syncStatus==="offline"?"#95a5a6":"#2ecc71",
+              display:"flex",alignItems:"center",gap:4}}>
+            <span style={{display:"inline-block",animation:syncStatus==="syncing"?"spin 1s linear infinite":"none"}}>
+              {syncStatus==="syncing"?"⟳":syncStatus==="ok"?"☁":syncStatus==="error"?"⚠":syncStatus==="offline"?"⚡":"☁"}
+            </span>
+            <span className="sync-label" style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":syncStatus==="offline"?"오프라인":"동기화"}</span>
+          </button>
+          <button className="header-action" onClick={()=>exportXLSX(liveEntries,cats,liveContacts)} style={{padding:"7px 10px",background:"#27ae60",color:"#fff",border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer"}}>📊 엑셀</button>
+          <button className="header-action" onClick={openNew} style={{padding:"7px 12px",background:"#e74c3c",color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
+        </div>
+      </header>
+
+      {/* 선택 액션 바 */}
+      {selActive&&(
+        <SelectionBar
+          selected={selected} entries={liveEntries} cats={cats}
+          barRef={selBarRef}
+          onClear={()=>setSelected(new Set())}
+          onMarkDone={()=>markDone(true)}
+          onMarkUndone={()=>markDone(false)}
+          onDelete={deleteSelected}
+        />
+      )}
+
+      {/* 사이드바 */}
+      {showSidebar&&(
+        <div style={{position:"fixed",inset:0,zIndex:250}} onClick={()=>setShowSidebar(false)}>
+          <div onClick={e=>e.stopPropagation()} style={{position:"absolute",top:0,left:0,width:240,height:"100%",background:"#fff",boxShadow:"4px 0 20px rgba(0,0,0,0.15)",overflowY:"auto",paddingTop:60,boxSizing:"border-box"}}>
+            <div style={{padding:"12px 14px 8px",fontSize:11,color:"#555",fontWeight:700}}>📋 분류로 바로가기</div>
+            <div style={{padding:"0 14px 10px",fontSize:11,color:"#aaa",lineHeight:1.5}}>탭을 누르면 해당 분류만 표시됩니다</div>
+            {[{id:"all",label:"전체",icon:"◈",color:"#34495e"},...cats].map(cat=>(
+              <button key={cat.id} onClick={()=>{setCatFilter(cat.id);setTab("list");setShowSidebar(false);}} style={{width:"100%",textAlign:"left",padding:"11px 16px",border:"none",background:catFilter===cat.id&&tab==="list"?colorToBg(cat.color):"transparent",borderLeft:catFilter===cat.id&&tab==="list"?"3px solid "+cat.color:"3px solid transparent",cursor:"pointer",display:"flex",alignItems:"center",gap:8,fontSize:14,color:catFilter===cat.id&&tab==="list"?cat.color:"#444",fontWeight:catFilter===cat.id&&tab==="list"?700:400}}>
+                <span>{cat.icon}</span><span style={{flex:1}}>{cat.label}</span>
+                {cat.id!=="all"&&counts[cat.id]>0&&<span style={{background:cat.color,color:"#fff",borderRadius:10,padding:"1px 6px",fontSize:11,fontWeight:700}}>{counts[cat.id]}</span>}
+              </button>
+            ))}
+            <div style={{margin:"12px 14px 0",borderTop:"1px solid #eee",paddingTop:12,display:"flex",flexDirection:"column",gap:10}}>
+              <button onClick={()=>{setShowCatMgr(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#555",fontWeight:600}}>⚙️ 분류 관리</button>
+              <button onClick={()=>{setShowPwModal(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #ccc",borderRadius:8,background:"#fff",fontSize:13,cursor:"pointer",color:"#555",fontWeight:600}}>
+                {storageGet(LS, PW_KEY)?'🔑 비밀번호 변경':'🔒 비밀번호 설정'}
+              </button>
+              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#666",cursor:"pointer"}}>
+                <input type="checkbox" checked={showDone} onChange={e=>setShowDone(e.target.checked)} style={{accentColor:"#27ae60",width:16,height:16}}/>완료 항목 보기
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 현재 탭 타이틀 바 */}
+      <div style={{background:"#fff",borderBottom:"1px solid #e0e0da",padding:"10px 16px",display:"flex",alignItems:"center",gap:8}}>
+        {tab==="list" && <>
+          <span style={{fontSize:13,fontWeight:700,color:"#1a1a2e"}}>
+            {catFilter==="all" ? "전체 목록" : (cats.find(c=>c.id===catFilter)?.icon+" "+cats.find(c=>c.id===catFilter)?.label)}
+          </span>
+          {catFilter!=="all" && <button onClick={()=>setCatFilter("all")} style={{fontSize:11,color:"#999",background:"none",border:"none",cursor:"pointer",padding:"2px 6px"}}>✕ 전체보기</button>}
+        </>}
+        {tab==="date"    && <span style={{fontSize:13,fontWeight:700,color:"#1a1a2e"}}>📅 날짜별</span>}
+        {tab==="tag"     && <span style={{fontSize:13,fontWeight:700,color:"#1a1a2e"}}>🏷️ 태그별</span>}
+        {tab==="paste"   && <span style={{fontSize:13,fontWeight:700,color:"#1a1a2e"}}>✏️ 텍스트 입력</span>}
+        {tab==="contact" && <span style={{fontSize:13,fontWeight:700,color:"#1a1a2e"}}>👤 담당자</span>}
+      </div>
+      </div>{/* /sticky container */}
+
+      {/* 콘텐츠 */}
+      <div style={{padding:"14px 14px 80px",maxWidth:700,margin:"0 auto"}}>
+        {tab==="list"&&(
+          <div style={{display:"flex",gap:8,marginBottom:12}}>
+            <div style={{flex:1,position:"relative"}}>
+              <span style={{position:"absolute",left:10,top:"50%",transform:"translateY(-50%)",color:"#aaa",fontSize:14,pointerEvents:"none"}}>🔍</span>
+              <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="검색..." style={{width:"100%",padding:"10px 10px 10px 34px",border:"1px solid #ddd",borderRadius:8,fontSize:14,boxSizing:"border-box"}}/>
+            </div>
+            <select value={sortBy} onChange={e=>setSortBy(e.target.value)} style={{padding:"10px 8px",border:"1px solid #ddd",borderRadius:8,fontSize:12,background:"#fff",color:"#555",flexShrink:0}}>
+              <option value="priority">마감임박순</option>
+              <option value="date_desc">최신순</option>
+              <option value="date_asc">오래된순</option>
+            </select>
+          </div>
+        )}
+
+        {tab==="list"&&(filtered.length===0?<Empty/>:<div style={{display:"flex",flexDirection:"column",gap:8}}>{filtered.map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>)}</div>)}
+        {tab==="date"   &&<DateView entries={liveEntries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>} 
+        {tab==="tag"    &&<TagView  entries={liveEntries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>} 
+        {tab==="paste"  &&<PasteTab cats={cats} onAddEntry={addEntry}/>}
+        {tab==="contact"&&<ContactTab contacts={liveContacts} onSave={saveContacts} onForceSave={forceSaveContacts}/>} 
+      </div>
+
+      {/* FAB */}
+      {tab!=="paste"&&tab!=="contact"&&(
+        <button onClick={openNew} style={{position:"fixed",bottom:24,right:20,width:56,height:56,borderRadius:"50%",background:"#e74c3c",color:"#fff",border:"none",fontSize:28,cursor:"pointer",boxShadow:"0 4px 16px rgba(0,0,0,0.25)",zIndex:150,display:"flex",alignItems:"center",justifyContent:"center"}}>+</button>
+      )}
+
+      {/* 모달들 */}
+      {modal&&<EntryModal initial={modal.entry||blankForm()} cats={cats} onSubmit={submitForm} onCancel={closeModal}/>}
+      {showCatMgr&&<CatManageModal cats={cats} onSave={saveCatsWithMigrate} onClose={()=>setShowCatMgr(false)}/>}
+      {showPwModal&&<PasswordModal onClose={()=>setShowPwModal(false)}/>}
+
+      {/* ── 하단 네비게이션 바 ── */}
+      <nav style={{position:"fixed",bottom:0,left:0,right:0,zIndex:190,background:"#fff",borderTop:"1px solid #e0e0da",display:"flex",alignItems:"stretch",boxShadow:"0 -2px 12px rgba(0,0,0,0.08)"}}>
+        {NAV_TABS.map(t=>(
+          <button key={t.id} onClick={()=>setTab(t.id)}
+            style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"8px 2px 10px",border:"none",background:"none",cursor:"pointer",
+              color:tab===t.id?"#1a1a2e":"#aaa",
+              borderTop:tab===t.id?"2.5px solid #1a1a2e":"2.5px solid transparent",
+              gap:3,transition:"all 0.15s",position:"relative"}}>
+            <span style={{fontSize:20,lineHeight:1}}>{t.icon}</span>
+            <span style={{fontSize:10,fontWeight:tab===t.id?700:400}}>{t.label}</span>
+            {t.id==="list"&&totalActive>0&&(
+              <span style={{position:"absolute",top:5,right:"calc(50% - 16px)",background:"#e74c3c",color:"#fff",borderRadius:10,padding:"1px 5px",fontSize:9,fontWeight:700,lineHeight:1.4}}>
+                {totalActive}
+              </span>
+            )}
+          </button>
+        ))}
+      </nav>
+    </div>
+  );
+}
+
+
+const domRoot = ReactDOM.createRoot(document.getElementById('root'));
+domRoot.render(React.createElement(App));
+</script>
+</body>
+</html>

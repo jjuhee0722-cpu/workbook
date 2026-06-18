@@ -17,6 +17,14 @@
     ::-webkit-scrollbar { width: 4px; height: 4px; }
     ::-webkit-scrollbar-thumb { background: #ccc; border-radius: 4px; }
     @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .app-title, .header-action, .sync-label { white-space: nowrap; }
+    @media (max-width: 480px) {
+      .app-header { padding: 0 8px !important; }
+      .app-header-left, .app-header-actions { gap: 5px !important; }
+      .app-title { font-size: 14px !important; }
+      .header-count, .sync-label { display: none !important; }
+      .header-action { padding: 7px 8px !important; font-size: 11px !important; }
+    }
   </style>
 </head>
 <body>
@@ -98,6 +106,27 @@ async function idbClear(store) {
     req.onerror = e => reject(e.target.error);
   });
 }
+async function idbReplaceAll(store, items) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(store, "readwrite");
+    const objectStore = tx.objectStore(store);
+    objectStore.clear();
+    items.forEach(item => objectStore.put(item));
+    tx.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    tx.onerror = () => {
+      db.close();
+      reject(tx.error);
+    };
+    tx.onabort = () => {
+      db.close();
+      reject(tx.error || new Error("IndexedDB transaction aborted"));
+    };
+  });
+}
 
 // meta 단건 (cats 등 배열 통째로 저장)
 async function idbGetMeta(key) {
@@ -170,6 +199,18 @@ function storageRemove(store, key) {
   } catch {
     return false;
   }
+}
+async function hashPassword(value) {
+  const bytes = new TextEncoder().encode(value);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return "sha256:" + Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, "0")).join("");
+}
+async function verifyPassword(input, stored) {
+  if (!stored) return false;
+  if (stored.startsWith("sha256:")) return (await hashPassword(input)) === stored;
+  if (input !== stored) return false;
+  storageSet(LS, PW_KEY, await hashPassword(input));
+  return true;
 }
 
 // 직렬화 잠금 — pull/push가 동시에 겹쳐 서로 덮어쓰는 경쟁(race) 방지
@@ -418,13 +459,42 @@ function attachIcon(t) {
 // 구 버전(photo 단일) → 신 버전(photos 배열) 마이그레이션
 const migrateEntry = e => ({
   ...e,
+  updatedAt: Number(e.updatedAt || e.createdAt || 0),
+  deletedAt: Number(e.deletedAt || 0),
   photos: e.photos || (e.photo ? [e.photo] : []),
   attachments: e.attachments || []
 });
 const migrateContact = c => ({
   ...c,
+  updatedAt: Number(c.updatedAt || c.createdAt || 0),
+  deletedAt: Number(c.deletedAt || 0),
   photos: c.photos || (c.photo ? [c.photo] : [])
 });
+const isLiveRecord = record => !record.deletedAt;
+const recordVersion = record => Math.max(Number(record?.updatedAt || 0), Number(record?.deletedAt || 0));
+function mergeRecords(local, remote, migrate, preferLocalOrder = true) {
+  const l = (local || []).map(migrate),
+    r = (remote || []).map(migrate);
+  const lMap = new Map(l.map(item => [item.id, item]));
+  const rMap = new Map(r.map(item => [item.id, item]));
+  const primary = preferLocalOrder ? l : r;
+  const secondary = preferLocalOrder ? r : l;
+  const ids = [...primary.map(item => item.id), ...secondary.map(item => item.id)].filter((id, index, all) => id && all.indexOf(id) === index);
+  return ids.map(id => {
+    const left = lMap.get(id),
+      right = rMap.get(id);
+    if (!left) return right;
+    if (!right) return left;
+    const lv = recordVersion(left),
+      rv = recordVersion(right);
+    if (lv === rv) return preferLocalOrder ? left : right;
+    return lv > rv ? left : right;
+  });
+}
+function sameRecords(a, b, migrate) {
+  const normalize = list => (list || []).map(migrate).sort((x, y) => String(x.id).localeCompare(String(y.id)));
+  return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b));
+}
 function getDday(dl) {
   if (!dl) return null;
   const t = new Date();
@@ -553,7 +623,7 @@ function TagChip({
       opacity: 0.6,
       lineHeight: 1
     }
-  }, "✕"));
+  }, "\u2715"));
 }
 function CatBadge({
   id,
@@ -588,7 +658,7 @@ function PriBadge({
       fontWeight: 700,
       whiteSpace: "nowrap"
     }
-  }, "● ", p.label);
+  }, "\u25CF ", p.label);
 }
 
 // ══════════════════════════════════════════════════════════
@@ -678,7 +748,7 @@ function Card({
       color: "#27ae60",
       fontWeight: 700
     }
-  }, "✓ 완료")), /*#__PURE__*/React.createElement("div", {
+  }, "\u2713 \uC644\uB8CC")), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 15,
       fontWeight: 600,
@@ -752,7 +822,7 @@ function Card({
       color: "#444",
       minWidth: 44
     }
-  }, "수정"), /*#__PURE__*/React.createElement("button", {
+  }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
     onClick: () => onDelete(entry.id),
     style: {
       padding: "5px 8px",
@@ -764,7 +834,7 @@ function Card({
       color: "#c0392b",
       minWidth: 44
     }
-  }, "삭제")));
+  }, "\uC0AD\uC81C")));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -819,7 +889,7 @@ function SelectionBar({
       fontWeight: 700,
       fontSize: 13
     }
-  }, selected.size, "개 선택됨"), /*#__PURE__*/React.createElement("div", {
+  }, selected.size, "\uAC1C \uC120\uD0DD\uB428"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 4,
@@ -875,7 +945,7 @@ function SelectionBar({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "✓ 완료(", undoneCount, ")"), doneCount > 0 && /*#__PURE__*/React.createElement("button", {
+  }, "\u2713 \uC644\uB8CC(", undoneCount, ")"), doneCount > 0 && /*#__PURE__*/React.createElement("button", {
     onClick: onMarkUndone,
     style: {
       padding: "6px 12px",
@@ -887,7 +957,7 @@ function SelectionBar({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "↩ 미완료(", doneCount, ")"), /*#__PURE__*/React.createElement("button", {
+  }, "\u21A9 \uBBF8\uC644\uB8CC(", doneCount, ")"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       if (window.confirm(selected.size + "개를 삭제하시겠습니까?")) onDelete();
     },
@@ -901,7 +971,7 @@ function SelectionBar({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "🗑 삭제(", selected.size, ")"), /*#__PURE__*/React.createElement("button", {
+  }, "\uD83D\uDDD1 \uC0AD\uC81C(", selected.size, ")"), /*#__PURE__*/React.createElement("button", {
     onClick: onClear,
     style: {
       padding: "6px 10px",
@@ -912,7 +982,7 @@ function SelectionBar({
       fontSize: 12,
       cursor: "pointer"
     }
-  }, "해제")));
+  }, "\uD574\uC81C")));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1017,7 +1087,7 @@ function EntryModal({
       color: "#1a1a2e",
       marginBottom: 16
     }
-  }, initial.id ? "항목 수정" : "새 항목 추가"), /*#__PURE__*/React.createElement(Lbl, null, "분류"), /*#__PURE__*/React.createElement(MobSelect, {
+  }, initial.id ? "항목 수정" : "새 항목 추가"), /*#__PURE__*/React.createElement(Lbl, null, "\uBD84\uB958"), /*#__PURE__*/React.createElement(MobSelect, {
     value: form.category,
     onChange: v => f("category", v),
     style: {
@@ -1033,13 +1103,13 @@ function EntryModal({
       gap: 10,
       marginBottom: 12
     }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "우선순위"), /*#__PURE__*/React.createElement(MobSelect, {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC6B0\uC120\uC21C\uC704"), /*#__PURE__*/React.createElement(MobSelect, {
     value: form.priority,
     onChange: v => f("priority", v)
   }, PRIS.map(p => /*#__PURE__*/React.createElement("option", {
     key: p.id,
     value: p.id
-  }, p.label)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "작성 날짜"), /*#__PURE__*/React.createElement("input", {
+  }, p.label)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC791\uC131 \uB0A0\uC9DC"), /*#__PURE__*/React.createElement("input", {
     type: "date",
     value: form.date,
     onChange: e => f("date", e.target.value),
@@ -1051,7 +1121,7 @@ function EntryModal({
       fontSize: 14,
       boxSizing: "border-box"
     }
-  }))), /*#__PURE__*/React.createElement(Lbl, null, "🗓 마감기한 (선택)"), /*#__PURE__*/React.createElement("input", {
+  }))), /*#__PURE__*/React.createElement(Lbl, null, "\uD83D\uDDD3 \uB9C8\uAC10\uAE30\uD55C (\uC120\uD0DD)"), /*#__PURE__*/React.createElement("input", {
     type: "date",
     value: form.deadline || "",
     onChange: e => f("deadline", e.target.value),
@@ -1064,10 +1134,10 @@ function EntryModal({
       boxSizing: "border-box",
       marginBottom: 12
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "제목 *"), /*#__PURE__*/React.createElement("input", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uC81C\uBAA9 *"), /*#__PURE__*/React.createElement("input", {
     value: form.title,
     onChange: e => f("title", e.target.value),
-    placeholder: "제목을 입력하세요",
+    placeholder: "\uC81C\uBAA9\uC744 \uC785\uB825\uD558\uC138\uC694",
     style: {
       width: "100%",
       padding: "11px 10px",
@@ -1077,14 +1147,14 @@ function EntryModal({
       boxSizing: "border-box",
       marginBottom: 12
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "내용"), /*#__PURE__*/React.createElement("textarea", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uB0B4\uC6A9"), /*#__PURE__*/React.createElement("textarea", {
     ref: bodyRef,
     value: form.body,
     onChange: e => {
       f("body", e.target.value);
       autoResize(e.target);
     },
-    placeholder: "세부 내용...",
+    placeholder: "\uC138\uBD80 \uB0B4\uC6A9...",
     rows: 6,
     style: {
       width: "100%",
@@ -1100,7 +1170,7 @@ function EntryModal({
       lineHeight: 1.7,
       overflow: "hidden"
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "📷 사진 (여러 장 가능)"), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uD83D\uDCF7 \uC0AC\uC9C4 (\uC5EC\uB7EC \uC7A5 \uAC00\uB2A5)"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -1145,7 +1215,7 @@ function EntryModal({
       padding: 0,
       lineHeight: 1
     }
-  }, "✕"))), /*#__PURE__*/React.createElement("button", {
+  }, "\u2715"))), /*#__PURE__*/React.createElement("button", {
     onClick: () => !uploading && photoRef.current?.click(),
     style: {
       width: 72,
@@ -1167,7 +1237,7 @@ function EntryModal({
       fontSize: 18,
       animation: "spin 1s linear infinite"
     }
-  }, "⟳") : "＋")), /*#__PURE__*/React.createElement("input", {
+  }, "\u27F3") : "＋")), /*#__PURE__*/React.createElement("input", {
     ref: photoRef,
     type: "file",
     accept: "image/*",
@@ -1179,7 +1249,7 @@ function EntryModal({
       if (e.target.files.length) addPhotos(e.target.files);
       e.target.value = "";
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "📎 파일 첨부 (선택)"), (form.attachments || []).length > 0 && /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uD83D\uDCCE \uD30C\uC77C \uCCA8\uBD80 (\uC120\uD0DD)"), (form.attachments || []).length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -1228,7 +1298,7 @@ function EntryModal({
       flexShrink: 0,
       padding: "0 2px"
     }
-  }, "✕")))), /*#__PURE__*/React.createElement("button", {
+  }, "\u2715")))), /*#__PURE__*/React.createElement("button", {
     onClick: () => !uploading && fileRef.current?.click(),
     style: {
       width: "100%",
@@ -1252,7 +1322,7 @@ function EntryModal({
       if (e.target.files.length) addFiles(e.target.files);
       e.target.value = "";
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "태그"), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uD0DC\uADF8"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -1278,7 +1348,7 @@ function EntryModal({
         addTag();
       }
     },
-    placeholder: "#태그 입력 후 Enter",
+    placeholder: "#\uD0DC\uADF8 \uC785\uB825 \uD6C4 Enter",
     style: {
       flex: 1,
       padding: "10px",
@@ -1296,7 +1366,7 @@ function EntryModal({
       fontSize: 13,
       cursor: "pointer"
     }
-  }, "추가")), /*#__PURE__*/React.createElement("div", {
+  }, "\uCD94\uAC00")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 10
@@ -1313,7 +1383,7 @@ function EntryModal({
       cursor: "pointer",
       color: "#555"
     }
-  }, "취소"), /*#__PURE__*/React.createElement("button", {
+  }, "\uCDE8\uC18C"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       if (form.title.trim()) onSubmit(form);
     },
@@ -1408,7 +1478,7 @@ function CatManageModal({
       color: "#1a1a2e",
       marginBottom: 16
     }
-  }, "분류 관리"), /*#__PURE__*/React.createElement("div", {
+  }, "\uBD84\uB958 \uAD00\uB9AC"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -1428,7 +1498,7 @@ function CatManageModal({
     style: {
       marginBottom: 8
     }
-  }, /*#__PURE__*/React.createElement(Lbl, null, "이름"), /*#__PURE__*/React.createElement("input", {
+  }, /*#__PURE__*/React.createElement(Lbl, null, "\uC774\uB984"), /*#__PURE__*/React.createElement("input", {
     value: cat.label,
     onChange: e => upd(cat.id, "label", e.target.value),
     style: {
@@ -1443,7 +1513,7 @@ function CatManageModal({
     style: {
       marginBottom: 8
     }
-  }, /*#__PURE__*/React.createElement(Lbl, null, "아이콘"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(Lbl, null, "\uC544\uC774\uCF58"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -1465,7 +1535,7 @@ function CatManageModal({
     style: {
       marginBottom: 10
     }
-  }, /*#__PURE__*/React.createElement(Lbl, null, "색상"), /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement(Lbl, null, "\uC0C9\uC0C1"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 5,
@@ -1507,7 +1577,7 @@ function CatManageModal({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "완료")) : /*#__PURE__*/React.createElement("div", {
+  }, "\uC644\uB8CC")) : /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -1535,7 +1605,7 @@ function CatManageModal({
       cursor: "pointer",
       color: "#444"
     }
-  }, "수정"), /*#__PURE__*/React.createElement("button", {
+  }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
     onClick: () => del(cat.id),
     style: {
       padding: "5px 10px",
@@ -1546,7 +1616,7 @@ function CatManageModal({
       cursor: "pointer",
       color: "#c0392b"
     }
-  }, "삭제"))))), /*#__PURE__*/React.createElement("div", {
+  }, "\uC0AD\uC81C"))))), /*#__PURE__*/React.createElement("div", {
     style: {
       border: "1px dashed #ccc",
       borderRadius: 10,
@@ -1559,10 +1629,10 @@ function CatManageModal({
       color: "#555",
       marginBottom: 10
     }
-  }, "+ 새 분류 추가"), /*#__PURE__*/React.createElement(Lbl, null, "이름"), /*#__PURE__*/React.createElement("input", {
+  }, "+ \uC0C8 \uBD84\uB958 \uCD94\uAC00"), /*#__PURE__*/React.createElement(Lbl, null, "\uC774\uB984"), /*#__PURE__*/React.createElement("input", {
     value: newLabel,
     onChange: e => setNewLabel(e.target.value),
-    placeholder: "분류 이름",
+    placeholder: "\uBD84\uB958 \uC774\uB984",
     style: {
       width: "100%",
       padding: "9px 10px",
@@ -1572,7 +1642,7 @@ function CatManageModal({
       boxSizing: "border-box",
       marginBottom: 10
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "아이콘"), /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uC544\uC774\uCF58"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexWrap: "wrap",
@@ -1591,7 +1661,7 @@ function CatManageModal({
       fontSize: 15,
       cursor: "pointer"
     }
-  }, ic))), /*#__PURE__*/React.createElement(Lbl, null, "색상"), /*#__PURE__*/React.createElement("div", {
+  }, ic))), /*#__PURE__*/React.createElement(Lbl, null, "\uC0C9\uC0C1"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 5,
@@ -1636,7 +1706,7 @@ function CatManageModal({
       fontWeight: 700,
       cursor: newLabel.trim() ? "pointer" : "not-allowed"
     }
-  }, "추가")), /*#__PURE__*/React.createElement("div", {
+  }, "\uCD94\uAC00")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 10,
@@ -1654,7 +1724,7 @@ function CatManageModal({
       cursor: "pointer",
       color: "#555"
     }
-  }, "취소"), /*#__PURE__*/React.createElement("button", {
+  }, "\uCDE8\uC18C"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       onSave(list);
       onClose();
@@ -1670,7 +1740,7 @@ function CatManageModal({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "저장"))));
+  }, "\uC800\uC7A5"))));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -1932,10 +2002,10 @@ function ContactTab({
       fontSize: 14,
       pointerEvents: "none"
     }
-  }, "🔍"), /*#__PURE__*/React.createElement("input", {
+  }, "\uD83D\uDD0D"), /*#__PURE__*/React.createElement("input", {
     value: search,
     onChange: e => setSearch(e.target.value),
-    placeholder: "검색...",
+    placeholder: "\uAC80\uC0C9...",
     style: {
       width: "100%",
       padding: "10px 10px 10px 34px",
@@ -1961,7 +2031,7 @@ function ContactTab({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "+ 추가")), canDrag && filtered.length > 1 && /*#__PURE__*/React.createElement("div", {
+  }, "+ \uCD94\uAC00")), canDrag && filtered.length > 1 && /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
       color: "#bbb",
@@ -1969,7 +2039,7 @@ function ContactTab({
       textAlign: "center",
       letterSpacing: 0.3
     }
-  }, "☰ 핸들을 드래그해서 순서 변경"), filtered.length === 0 ? /*#__PURE__*/React.createElement("div", {
+  }, "\u2630 \uD578\uB4E4\uC744 \uB4DC\uB798\uADF8\uD574\uC11C \uC21C\uC11C \uBCC0\uACBD"), filtered.length === 0 ? /*#__PURE__*/React.createElement("div", {
     style: {
       textAlign: "center",
       padding: "50px 0",
@@ -1980,11 +2050,11 @@ function ContactTab({
       fontSize: 40,
       marginBottom: 10
     }
-  }, "👤"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDC64"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 14
     }
-  }, "담당자가 없습니다.")) : /*#__PURE__*/React.createElement("div", {
+  }, "\uB2F4\uB2F9\uC790\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4.")) : /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -2037,7 +2107,7 @@ function ContactTab({
         fontSize: 20,
         letterSpacing: -1
       }
-    }, "☰"), /*#__PURE__*/React.createElement("div", {
+    }, "\u2630"), /*#__PURE__*/React.createElement("div", {
       style: {
         flex: 1,
         minWidth: 0,
@@ -2060,7 +2130,7 @@ function ContactTab({
         borderRadius: 8,
         fontWeight: 700
       }
-    }, "🏢 ", c.company), c.title && /*#__PURE__*/React.createElement("span", {
+    }, "\uD83C\uDFE2 ", c.company), c.title && /*#__PURE__*/React.createElement("span", {
       style: {
         fontSize: 11,
         background: "#f0f0f0",
@@ -2075,13 +2145,13 @@ function ContactTab({
         color: "#1a1a2e",
         marginBottom: 4
       }
-    }, "👤 ", c.name || "(이름 없음)"), c.role && /*#__PURE__*/React.createElement("div", {
+    }, "\uD83D\uDC64 ", c.name || "(이름 없음)"), c.role && /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 13,
         color: "#555",
         marginBottom: 4
       }
-    }, "💼 ", c.role), /*#__PURE__*/React.createElement("div", {
+    }, "\uD83D\uDCBC ", c.role), /*#__PURE__*/React.createElement("div", {
       style: {
         display: "flex",
         gap: 12,
@@ -2094,14 +2164,14 @@ function ContactTab({
         color: "#2980b9",
         textDecoration: "none"
       }
-    }, "📞 ", c.phone), c.email && /*#__PURE__*/React.createElement("a", {
+    }, "\uD83D\uDCDE ", c.phone), c.email && /*#__PURE__*/React.createElement("a", {
       href: "mailto:" + c.email,
       style: {
         fontSize: 13,
         color: "#27ae60",
         textDecoration: "none"
       }
-    }, "✉️ ", c.email)), c.memo && /*#__PURE__*/React.createElement("div", {
+    }, "\u2709\uFE0F ", c.email)), c.memo && /*#__PURE__*/React.createElement("div", {
       style: {
         fontSize: 12,
         color: "#888",
@@ -2135,7 +2205,7 @@ function ContactTab({
         cursor: "pointer",
         color: "#444"
       }
-    }, "수정"), /*#__PURE__*/React.createElement("button", {
+    }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
       onClick: () => !isDragging && del(c.id),
       style: {
         padding: "5px 10px",
@@ -2146,7 +2216,7 @@ function ContactTab({
         cursor: "pointer",
         color: "#c0392b"
       }
-    }, "삭제"))));
+    }, "\uC0AD\uC81C"))));
   })), modal && /*#__PURE__*/React.createElement("div", {
     style: {
       position: "fixed",
@@ -2243,7 +2313,7 @@ function ContactForm({
       color: "#1a1a2e",
       marginBottom: 16
     }
-  }, initial.name ? "담당자 수정" : "담당자 추가"), /*#__PURE__*/React.createElement(Lbl, null, "📇 명함 사진 (여러 장 가능)"), /*#__PURE__*/React.createElement("div", {
+  }, initial.name ? "담당자 수정" : "담당자 추가"), /*#__PURE__*/React.createElement(Lbl, null, "\uD83D\uDCC7 \uBA85\uD568 \uC0AC\uC9C4 (\uC5EC\uB7EC \uC7A5 \uAC00\uB2A5)"), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 6,
@@ -2288,7 +2358,7 @@ function ContactForm({
       padding: 0,
       lineHeight: 1
     }
-  }, "✕"))), /*#__PURE__*/React.createElement("button", {
+  }, "\u2715"))), /*#__PURE__*/React.createElement("button", {
     onClick: () => !uploading && photoRef.current?.click(),
     style: {
       width: 72,
@@ -2310,7 +2380,7 @@ function ContactForm({
       fontSize: 18,
       animation: "spin 1s linear infinite"
     }
-  }, "⟳") : "＋")), /*#__PURE__*/React.createElement("input", {
+  }, "\u27F3") : "＋")), /*#__PURE__*/React.createElement("input", {
     ref: photoRef,
     type: "file",
     accept: "image/*",
@@ -2347,10 +2417,10 @@ function ContactForm({
     style: {
       marginBottom: 20
     }
-  }, /*#__PURE__*/React.createElement(Lbl, null, "📝 메모"), /*#__PURE__*/React.createElement("textarea", {
+  }, /*#__PURE__*/React.createElement(Lbl, null, "\uD83D\uDCDD \uBA54\uBAA8"), /*#__PURE__*/React.createElement("textarea", {
     value: form.memo || "",
     onChange: e => f("memo", e.target.value),
-    placeholder: "기타 메모...",
+    placeholder: "\uAE30\uD0C0 \uBA54\uBAA8...",
     rows: 3,
     style: {
       width: "100%",
@@ -2379,7 +2449,7 @@ function ContactForm({
       cursor: "pointer",
       color: "#555"
     }
-  }, "취소"), /*#__PURE__*/React.createElement("button", {
+  }, "\uCDE8\uC18C"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       if (form.name?.trim()) onSubmit(form);else alert("성함을 입력해주세요.");
     },
@@ -2417,7 +2487,7 @@ function DateView({
   });
   const sorted = Object.entries(groups).sort((a, b) => b[0].localeCompare(a[0]));
   if (!sorted.length) return /*#__PURE__*/React.createElement(Empty, {
-    text: "미완료 항목이 없습니다."
+    text: "\uBBF8\uC644\uB8CC \uD56D\uBAA9\uC774 \uC5C6\uC2B5\uB2C8\uB2E4."
   });
   return /*#__PURE__*/React.createElement("div", null, sorted.map(([date, items]) => /*#__PURE__*/React.createElement("div", {
     key: date,
@@ -2469,7 +2539,7 @@ function TagView({
   }));
   const tags = Object.keys(tagMap).sort();
   if (!tags.length) return /*#__PURE__*/React.createElement(Empty, {
-    text: "태그가 없습니다."
+    text: "\uD0DC\uADF8\uAC00 \uC5C6\uC2B5\uB2C8\uB2E4."
   });
   return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -2581,7 +2651,7 @@ function PasteTab({
       fontWeight: 700,
       marginBottom: 4
     }
-  }, "📋 수첩 내용 빠르게 입력"), /*#__PURE__*/React.createElement("div", null, "① 수첩 사진을 Claude 채팅창에 보내면 텍스트를 추출해드립니다"), /*#__PURE__*/React.createElement("div", null, "② 추출된 텍스트를 아래에 붙여넣기"), /*#__PURE__*/React.createElement("div", null, "③ 첫 줄은 제목, 나머지는 내용으로 자동 분리")), errMsg && /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCCB \uC218\uCCA9 \uB0B4\uC6A9 \uBE60\uB974\uAC8C \uC785\uB825"), /*#__PURE__*/React.createElement("div", null, "\u2460 \uC218\uCCA9 \uC0AC\uC9C4\uC744 Claude \uCC44\uD305\uCC3D\uC5D0 \uBCF4\uB0B4\uBA74 \uD14D\uC2A4\uD2B8\uB97C \uCD94\uCD9C\uD574\uB4DC\uB9BD\uB2C8\uB2E4"), /*#__PURE__*/React.createElement("div", null, "\u2461 \uCD94\uCD9C\uB41C \uD14D\uC2A4\uD2B8\uB97C \uC544\uB798\uC5D0 \uBD99\uC5EC\uB123\uAE30"), /*#__PURE__*/React.createElement("div", null, "\u2462 \uCCAB \uC904\uC740 \uC81C\uBAA9, \uB098\uBA38\uC9C0\uB294 \uB0B4\uC6A9\uC73C\uB85C \uC790\uB3D9 \uBD84\uB9AC")), errMsg && /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fdf2f2",
       border: "1px solid #f5c6c6",
@@ -2624,10 +2694,10 @@ function PasteTab({
       fontWeight: 700,
       cursor: pasteText.trim() ? "pointer" : "not-allowed"
     }
-  }, "→ 분류 선택")), stage === "assign" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "제목 *"), /*#__PURE__*/React.createElement("input", {
+  }, "\u2192 \uBD84\uB958 \uC120\uD0DD")), stage === "assign" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC81C\uBAA9 *"), /*#__PURE__*/React.createElement("input", {
     value: title,
     onChange: e => setTitle(e.target.value),
-    placeholder: "제목",
+    placeholder: "\uC81C\uBAA9",
     style: {
       width: "100%",
       padding: "11px 10px",
@@ -2637,14 +2707,14 @@ function PasteTab({
       boxSizing: "border-box",
       marginBottom: 12
     }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "내용"), /*#__PURE__*/React.createElement("textarea", {
+  }), /*#__PURE__*/React.createElement(Lbl, null, "\uB0B4\uC6A9"), /*#__PURE__*/React.createElement("textarea", {
     ref: bodyRef2,
     value: body,
     onChange: e => {
       setBody(e.target.value);
       autoResize2(e.target);
     },
-    placeholder: "내용 (선택)",
+    placeholder: "\uB0B4\uC6A9 (\uC120\uD0DD)",
     rows: 5,
     style: {
       width: "100%",
@@ -2667,13 +2737,13 @@ function PasteTab({
       gap: 10,
       marginBottom: 18
     }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "분류"), /*#__PURE__*/React.createElement(MobSelect, {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uBD84\uB958"), /*#__PURE__*/React.createElement(MobSelect, {
     value: category,
     onChange: setCategory
   }, cats.map(c => /*#__PURE__*/React.createElement("option", {
     key: c.id,
     value: c.id
-  }, c.icon, " ", c.label)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "우선순위"), /*#__PURE__*/React.createElement(MobSelect, {
+  }, c.icon, " ", c.label)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC6B0\uC120\uC21C\uC704"), /*#__PURE__*/React.createElement(MobSelect, {
     value: priority,
     onChange: setPriority
   }, PRIS.map(p => /*#__PURE__*/React.createElement("option", {
@@ -2698,7 +2768,7 @@ function PasteTab({
       cursor: "pointer",
       color: "#555"
     }
-  }, "← 수정"), /*#__PURE__*/React.createElement("button", {
+  }, "\u2190 \uC218\uC815"), /*#__PURE__*/React.createElement("button", {
     onClick: save,
     style: {
       flex: 1,
@@ -2711,7 +2781,7 @@ function PasteTab({
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "✅ 저장"))));
+  }, "\u2705 \uC800\uC7A5"))));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2844,7 +2914,7 @@ function PhotoViewer({
       fontSize: 22,
       padding: "5px 18px"
     }
-  }, "‹"), /*#__PURE__*/React.createElement("span", {
+  }, "\u2039"), /*#__PURE__*/React.createElement("span", {
     style: {
       color: "#ccc",
       fontSize: 13
@@ -2857,7 +2927,7 @@ function PhotoViewer({
       fontSize: 22,
       padding: "5px 18px"
     }
-  }, "›")), /*#__PURE__*/React.createElement("div", {
+  }, "\u203A")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       gap: 8,
@@ -2873,7 +2943,7 @@ function PhotoViewer({
       ...OB,
       background: "rgba(255,255,255,0.2)"
     }
-  }, "＋ 확대"), /*#__PURE__*/React.createElement("button", {
+  }, "\uFF0B \uD655\uB300"), /*#__PURE__*/React.createElement("button", {
     onClick: e => {
       e.stopPropagation();
       setScale(1);
@@ -2892,13 +2962,13 @@ function PhotoViewer({
       ...OB,
       background: "rgba(255,255,255,0.2)"
     }
-  }, "－ 축소"), /*#__PURE__*/React.createElement("button", {
+  }, "\uFF0D \uCD95\uC18C"), /*#__PURE__*/React.createElement("button", {
     onClick: download,
     style: {
       ...OB,
       background: "#27ae60"
     }
-  }, "⬇ 다운로드"), /*#__PURE__*/React.createElement("button", {
+  }, "\u2B07 \uB2E4\uC6B4\uB85C\uB4DC"), /*#__PURE__*/React.createElement("button", {
     onClick: e => {
       e.stopPropagation();
       onClose();
@@ -2907,7 +2977,7 @@ function PhotoViewer({
       ...OB,
       background: "rgba(255,255,255,0.15)"
     }
-  }, "✕ 닫기"))));
+  }, "\u2715 \uB2EB\uAE30"))));
 }
 function PhotoGallery({
   photos,
@@ -3011,7 +3081,7 @@ function AttachList({
       cursor: "pointer",
       flexShrink: 0
     }
-  }, "⬇"))));
+  }, "\u2B07"))));
 }
 const Empty = ({
   text = "항목이 없습니다."
@@ -3026,7 +3096,7 @@ const Empty = ({
     fontSize: 40,
     marginBottom: 10
   }
-}, "📝"), /*#__PURE__*/React.createElement("div", {
+}, "\uD83D\uDCDD"), /*#__PURE__*/React.createElement("div", {
   style: {
     fontSize: 14
   }
@@ -3043,8 +3113,8 @@ function PasswordModal({
   const [next1, setNext1] = useState('');
   const [next2, setNext2] = useState('');
   const [err, setErr] = useState('');
-  function save() {
-    if (hasPw && cur !== storageGet(LS, PW_KEY)) {
+  async function save() {
+    if (hasPw && !(await verifyPassword(cur, storageGet(LS, PW_KEY)))) {
       setErr('현재 비밀번호가 틀렸습니다.');
       return;
     }
@@ -3056,13 +3126,13 @@ function PasswordModal({
       setErr('비밀번호가 일치하지 않습니다.');
       return;
     }
-    storageSet(LS, PW_KEY, next1);
+    storageSet(LS, PW_KEY, await hashPassword(next1));
     alert('비밀번호가 변경되었습니다.');
     onClose();
   }
-  function removePw() {
+  async function removePw() {
     if (!window.confirm('비밀번호를 해제하시겠습니까?')) return;
-    if (hasPw && cur !== storageGet(LS, PW_KEY)) {
+    if (hasPw && !(await verifyPassword(cur, storageGet(LS, PW_KEY)))) {
       setErr('현재 비밀번호가 틀렸습니다.');
       return;
     }
@@ -3116,7 +3186,7 @@ function PasswordModal({
       color: '#1a1a2e',
       marginBottom: 18
     }
-  }, "🔑 비밀번호 ", hasPw ? '변경' : '설정'), err && /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDD11 \uBE44\uBC00\uBC88\uD638 ", hasPw ? '변경' : '설정'), err && /*#__PURE__*/React.createElement("div", {
     style: {
       background: '#fdf2f2',
       border: '1px solid #f5c6c6',
@@ -3132,11 +3202,11 @@ function PasswordModal({
       color: '#888',
       marginBottom: 4
     }
-  }, "현재 비밀번호"), /*#__PURE__*/React.createElement("input", {
+  }, "\uD604\uC7AC \uBE44\uBC00\uBC88\uD638"), /*#__PURE__*/React.createElement("input", {
     type: "password",
     value: cur,
     onChange: e => setCur(e.target.value),
-    placeholder: "현재 비밀번호",
+    placeholder: "\uD604\uC7AC \uBE44\uBC00\uBC88\uD638",
     style: IS,
     autoComplete: "current-password"
   })), /*#__PURE__*/React.createElement("div", {
@@ -3145,11 +3215,11 @@ function PasswordModal({
       color: '#888',
       marginBottom: 4
     }
-  }, "새 비밀번호"), /*#__PURE__*/React.createElement("input", {
+  }, "\uC0C8 \uBE44\uBC00\uBC88\uD638"), /*#__PURE__*/React.createElement("input", {
     type: "password",
     value: next1,
     onChange: e => setNext1(e.target.value),
-    placeholder: "새 비밀번호",
+    placeholder: "\uC0C8 \uBE44\uBC00\uBC88\uD638",
     style: IS,
     autoComplete: "new-password"
   }), /*#__PURE__*/React.createElement("div", {
@@ -3158,12 +3228,12 @@ function PasswordModal({
       color: '#888',
       marginBottom: 4
     }
-  }, "새 비밀번호 확인"), /*#__PURE__*/React.createElement("input", {
+  }, "\uC0C8 \uBE44\uBC00\uBC88\uD638 \uD655\uC778"), /*#__PURE__*/React.createElement("input", {
     type: "password",
     value: next2,
     onChange: e => setNext2(e.target.value),
     onKeyDown: e => e.key === 'Enter' && save(),
-    placeholder: "비밀번호 재입력",
+    placeholder: "\uBE44\uBC00\uBC88\uD638 \uC7AC\uC785\uB825",
     style: {
       ...IS,
       marginBottom: 16
@@ -3183,7 +3253,7 @@ function PasswordModal({
       cursor: 'pointer',
       marginBottom: 8
     }
-  }, "저장"), hasPw && /*#__PURE__*/React.createElement("button", {
+  }, "\uC800\uC7A5"), hasPw && /*#__PURE__*/React.createElement("button", {
     onClick: removePw,
     style: {
       width: '100%',
@@ -3196,7 +3266,7 @@ function PasswordModal({
       cursor: 'pointer',
       marginBottom: 8
     }
-  }, "비밀번호 해제"), /*#__PURE__*/React.createElement("button", {
+  }, "\uBE44\uBC00\uBC88\uD638 \uD574\uC81C"), /*#__PURE__*/React.createElement("button", {
     onClick: onClose,
     style: {
       width: '100%',
@@ -3208,7 +3278,7 @@ function PasswordModal({
       fontSize: 14,
       cursor: 'pointer'
     }
-  }, "취소")));
+  }, "\uCDE8\uC18C")));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -3228,8 +3298,8 @@ function LockScreen({
   useEffect(() => {
     setTimeout(() => inputRef.current?.focus(), 100);
   }, [mode]);
-  function unlock() {
-    if (input === storageGet(LS, PW_KEY)) {
+  async function unlock() {
+    if (await verifyPassword(input, storageGet(LS, PW_KEY))) {
       storageSet(SS, PW_SESSION, '1');
       onUnlock();
     } else {
@@ -3238,7 +3308,7 @@ function LockScreen({
       inputRef.current?.focus();
     }
   }
-  function setup() {
+  async function setup() {
     if (!pw) {
       setErr('비밀번호를 입력해주세요.');
       return;
@@ -3247,7 +3317,7 @@ function LockScreen({
       setErr('비밀번호가 일치하지 않습니다.');
       return;
     }
-    storageSet(LS, PW_KEY, pw);
+    storageSet(LS, PW_KEY, await hashPassword(pw));
     storageSet(SS, PW_SESSION, '1');
     onUnlock();
   }
@@ -3317,13 +3387,13 @@ function LockScreen({
       fontSize: 48,
       marginBottom: 10
     }
-  }, "🔒"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDD12"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 22,
       fontWeight: 700,
       color: '#1a1a2e'
     }
-  }, "업무수첩"), /*#__PURE__*/React.createElement("div", {
+  }, "\uC5C5\uBB34\uC218\uCCA9"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 13,
       color: '#aaa',
@@ -3346,24 +3416,24 @@ function LockScreen({
     value: input,
     onChange: e => setInput(e.target.value),
     onKeyDown: e => e.key === 'Enter' && unlock(),
-    placeholder: "••••••",
+    placeholder: "\u2022\u2022\u2022\u2022\u2022\u2022",
     style: IS,
     autoComplete: "current-password"
   }), /*#__PURE__*/React.createElement("button", {
     onClick: unlock,
     style: BTN
-  }, "잠금 해제")), mode === 'setup' && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+  }, "\uC7A0\uAE08 \uD574\uC81C")), mode === 'setup' && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 12,
       color: '#888',
       marginBottom: 4
     }
-  }, "새 비밀번호"), /*#__PURE__*/React.createElement("input", {
+  }, "\uC0C8 \uBE44\uBC00\uBC88\uD638"), /*#__PURE__*/React.createElement("input", {
     ref: inputRef,
     type: "password",
     value: pw,
     onChange: e => setPw(e.target.value),
-    placeholder: "비밀번호 입력",
+    placeholder: "\uBE44\uBC00\uBC88\uD638 \uC785\uB825",
     style: IS2,
     autoComplete: "new-password"
   }), /*#__PURE__*/React.createElement("div", {
@@ -3372,12 +3442,12 @@ function LockScreen({
       color: '#888',
       marginBottom: 4
     }
-  }, "비밀번호 확인"), /*#__PURE__*/React.createElement("input", {
+  }, "\uBE44\uBC00\uBC88\uD638 \uD655\uC778"), /*#__PURE__*/React.createElement("input", {
     type: "password",
     value: pw2,
     onChange: e => setPw2(e.target.value),
     onKeyDown: e => e.key === 'Enter' && setup(),
-    placeholder: "비밀번호 재입력",
+    placeholder: "\uBE44\uBC00\uBC88\uD638 \uC7AC\uC785\uB825",
     style: {
       ...IS2,
       marginBottom: 16
@@ -3386,7 +3456,7 @@ function LockScreen({
   }), /*#__PURE__*/React.createElement("button", {
     onClick: setup,
     style: BTN
-  }, "설정 완료"), /*#__PURE__*/React.createElement("button", {
+  }, "\uC124\uC815 \uC644\uB8CC"), /*#__PURE__*/React.createElement("button", {
     onClick: skip,
     style: {
       ...BTN,
@@ -3395,7 +3465,7 @@ function LockScreen({
       border: '1px solid #e0e0e0',
       fontWeight: 400
     }
-  }, "건너뛰기 (비밀번호 없이 사용)"))));
+  }, "\uAC74\uB108\uB6F0\uAE30 (\uBE44\uBC00\uBC88\uD638 \uC5C6\uC774 \uC0AC\uC6A9)"))));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -3439,21 +3509,15 @@ function App() {
   // ── 변경 시 IndexedDB 저장 ───────────────────────────
   useEffect(() => {
     if (!dbReady) return;
-    (async () => {
-      await idbClear(STORES.entries);
-      for (const e of entries) await idbPut(STORES.entries, e);
-    })();
+    idbReplaceAll(STORES.entries, entries).catch(e => console.error("IDB entries save", e));
   }, [entries, dbReady]);
   useEffect(() => {
     if (!dbReady) return;
-    idbSetMeta("cats", cats);
+    idbSetMeta("cats", cats).catch(e => console.error("IDB cats save", e));
   }, [cats, dbReady]);
   useEffect(() => {
     if (!dbReady) return;
-    (async () => {
-      await idbClear(STORES.contacts);
-      for (const c of contacts) await idbPut(STORES.contacts, c);
-    })();
+    idbReplaceAll(STORES.contacts, contacts).catch(e => console.error("IDB contacts save", e));
   }, [contacts, dbReady]);
 
   // ── 최신 state를 ref로 유지 (stale closure 방지) ───────
@@ -3483,53 +3547,21 @@ function App() {
         if (remote) {
           const {
             entries: curE,
-            cats: curC,
             contacts: curCon
           } = dataRef.current;
-
-          // 업무 항목: updatedAt 기준으로 최신 버전 유지
-          const lMap = Object.fromEntries(curE.map(e => [e.id, e]));
-          const rMap = Object.fromEntries((remote.entries || []).map(e => [e.id, e]));
-          const ids = new Set([...Object.keys(lMap), ...Object.keys(rMap)]);
-
-          // 로컬 변경이 원격보다 새로운 항목이 있는지 확인 (cascade 방지)
-          let hasLocalWins = false;
-          const merged = Array.from(ids).map(id => {
-            const l = lMap[id],
-              r = rMap[id];
-            if (!l) return migrateEntry(r);
-            if (!r) {
-              hasLocalWins = true;
-              return migrateEntry(l);
-            }
-            if ((l.updatedAt || 0) > (r.updatedAt || 0)) {
-              hasLocalWins = true;
-              return migrateEntry(l);
-            }
-            return migrateEntry(r);
-          });
-          setEntries(merged.sort((a, b) => b.createdAt - a.createdAt));
-
-          // 분류: 원격 우선
-          if (remote.cats && remote.cats.length) setCats(remote.cats);
-
-          // 담당자 병합:
-          //   ① 미push 변경 있음 → 로컬 순서 보호 (push 실패·대기 중 원상복구 방지)
-          //   ② 깨끗한 상태 → 원격 순서 적용 (다른 기기의 드래그 반영)
-          const rContacts = (remote.contacts || []).map(migrateContact);
-          const rIds = new Set(rContacts.map(c => c.id));
-          const lContacts = curCon.map(migrateContact);
-          const lIds = new Set(lContacts.map(c => c.id));
-          const remoteOnly = rContacts.filter(c => !lIds.has(c.id));
-          const localOnly = lContacts.filter(c => !rIds.has(c.id));
-          if (localDirtyRef.current) {
-            setContacts([...lContacts, ...remoteOnly]);
-            hasLocalWins = true;
-          } else {
-            if (localOnly.length > 0) hasLocalWins = true;
-            setContacts([...rContacts, ...localOnly]);
-          }
-          if (!hasLocalWins) localDirtyRef.current = false;
+          const preferLocal = localDirtyRef.current;
+          const mergedEntries = mergeRecords(curE, remote.entries || [], migrateEntry, preferLocal).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+          const mergedContacts = mergeRecords(curCon, remote.contacts || [], migrateContact, preferLocal);
+          const needsPush = preferLocal || !sameRecords(mergedEntries, remote.entries || [], migrateEntry) || !sameRecords(mergedContacts, remote.contacts || [], migrateContact);
+          dataRef.current = {
+            entries: mergedEntries,
+            cats: remote.cats?.length ? remote.cats : dataRef.current.cats,
+            contacts: mergedContacts
+          };
+          setEntries(mergedEntries);
+          setContacts(mergedContacts);
+          if (remote.cats?.length) setCats(remote.cats);
+          localDirtyRef.current = needsPush;
         }
         setSyncStatus("ok");
         return true;
@@ -3557,9 +3589,20 @@ function App() {
           cats: c,
           contacts: con
         } = dataRef.current;
-        const bytes = approxPayloadBytes(e, c, con);
+        const remote = await withRetry(sbPull);
+        const mergedEntries = mergeRecords(e, remote?.entries || [], migrateEntry, true).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const mergedContacts = mergeRecords(con, remote?.contacts || [], migrateContact, true);
+        const mergedCats = c?.length ? c : remote?.cats || DEFAULT_CATS;
+        const bytes = approxPayloadBytes(mergedEntries, mergedCats, mergedContacts);
         if (bytes > 4 * 1024 * 1024) console.warn("[sync] 페이로드가 큽니다(", (bytes / 1048576).toFixed(1), "MB). 사진/첨부가 많으면 동기화가 느려지거나 실패할 수 있습니다.");
-        await withRetry(() => sbPush(e, c, con));
+        await withRetry(() => sbPush(mergedEntries, mergedCats, mergedContacts));
+        dataRef.current = {
+          entries: mergedEntries,
+          cats: mergedCats,
+          contacts: mergedContacts
+        };
+        setEntries(mergedEntries);
+        setContacts(mergedContacts);
         localDirtyRef.current = false;
         setSyncStatus("ok");
       } catch (err) {
@@ -3642,23 +3685,31 @@ function App() {
   const closeModal = () => setModal(null);
   function submitForm(form) {
     localDirtyRef.current = true;
+    const now = Date.now();
     if (modal.entry) setEntries(p => p.map(e => e.id === modal.entry.id ? {
       ...form,
       id: modal.entry.id,
       createdAt: modal.entry.createdAt,
-      updatedAt: Date.now()
+      updatedAt: now,
+      deletedAt: 0
     } : e));else setEntries(p => [{
       ...form,
       id: uid(),
-      createdAt: Date.now(),
-      updatedAt: Date.now()
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: 0
     }, ...p]);
     closeModal();
   }
   function deleteEntry(id) {
     if (!window.confirm("삭제하시겠습니까?")) return;
     localDirtyRef.current = true;
-    setEntries(p => p.filter(e => e.id !== id));
+    const now = Date.now();
+    setEntries(p => p.map(e => e.id === id ? {
+      ...e,
+      deletedAt: now,
+      updatedAt: now
+    } : e));
     setSelected(s => {
       const n = new Set(s);
       n.delete(id);
@@ -3675,11 +3726,13 @@ function App() {
   }
   function addEntry(form) {
     localDirtyRef.current = true;
+    const now = Date.now();
     setEntries(p => [{
       ...form,
       id: uid(),
-      createdAt: Date.now(),
-      updatedAt: Date.now()
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: 0
     }, ...p]);
   }
 
@@ -3702,7 +3755,12 @@ function App() {
   }
   function deleteSelected() {
     localDirtyRef.current = true;
-    setEntries(p => p.filter(e => !selected.has(e.id)));
+    const now = Date.now();
+    setEntries(p => p.map(e => selected.has(e.id) ? {
+      ...e,
+      deletedAt: now,
+      updatedAt: now
+    } : e));
     setSelected(new Set());
   }
 
@@ -3722,35 +3780,17 @@ function App() {
           cats: curC,
           contacts: curCon
         } = dataRef.current;
-        let finalEntries = curE,
-          finalCats = curC,
-          finalContacts = curCon;
-        if (remote) {
-          if (remote.entries) {
-            const lMap = Object.fromEntries(curE.map(e => [e.id, e]));
-            const rMap = Object.fromEntries((remote.entries || []).map(e => [e.id, e]));
-            const ids = new Set([...Object.keys(lMap), ...Object.keys(rMap)]);
-            finalEntries = Array.from(ids).map(id => {
-              const l = lMap[id],
-                r = rMap[id];
-              if (!l) return migrateEntry(r);
-              if (!r) return migrateEntry(l);
-              return migrateEntry((l.updatedAt || 0) >= (r.updatedAt || 0) ? l : r);
-            });
-            setEntries(finalEntries.sort((a, b) => b.createdAt - a.createdAt));
-          }
-          if (remote.cats?.length) {
-            finalCats = remote.cats;
-            setCats(remote.cats);
-          }
-          if (remote.contacts?.length) {
-            const lCMap = Object.fromEntries(curCon.map(c => [c.id, c]));
-            const rCMap = Object.fromEntries(remote.contacts.map(c => [c.id, c]));
-            const cIds = new Set([...Object.keys(lCMap), ...Object.keys(rCMap)]);
-            finalContacts = Array.from(cIds).map(id => rCMap[id] || lCMap[id]);
-            setContacts(finalContacts);
-          }
-        }
+        const finalEntries = mergeRecords(curE, remote?.entries || [], migrateEntry, true).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+        const finalCats = curC?.length ? curC : remote?.cats || DEFAULT_CATS;
+        const finalContacts = mergeRecords(curCon, remote?.contacts || [], migrateContact, true);
+        dataRef.current = {
+          entries: finalEntries,
+          cats: finalCats,
+          contacts: finalContacts
+        };
+        setEntries(finalEntries);
+        setCats(finalCats);
+        setContacts(finalContacts);
         await withRetry(() => sbPush(finalEntries, finalCats, finalContacts));
         localDirtyRef.current = false;
         setSyncStatus("ok");
@@ -3774,24 +3814,58 @@ function App() {
     }));
     setCats(newCats);
   }
+  function prepareContactSnapshot(next) {
+    const previous = (dataRef.current.contacts || []).map(migrateContact);
+    const previousMap = new Map(previous.map(contact => [contact.id, contact]));
+    const nextIds = new Set(next.map(contact => contact.id));
+    const now = Date.now();
+    const stripMeta = contact => {
+      const {
+        updatedAt,
+        deletedAt,
+        order,
+        ...value
+      } = contact;
+      return value;
+    };
+    const live = next.map((contact, index) => {
+      const old = previousMap.get(contact.id);
+      const changed = !old || old.deletedAt || old.order !== index || JSON.stringify(stripMeta(old)) !== JSON.stringify(stripMeta(contact));
+      return {
+        ...contact,
+        order: index,
+        deletedAt: 0,
+        updatedAt: changed ? now : recordVersion(old)
+      };
+    });
+    const tombstones = previous.filter(contact => contact.deletedAt || !nextIds.has(contact.id)).map(contact => contact.deletedAt ? contact : {
+      ...contact,
+      deletedAt: now,
+      updatedAt: now
+    });
+    return [...live, ...tombstones];
+  }
+
   // 담당자 저장 — dirty 플래그 + dataRef 즉시 동기화 (stale closure 방지)
   function saveContacts(next) {
+    const snapshot = prepareContactSnapshot(next);
     localDirtyRef.current = true;
     dataRef.current = {
       ...dataRef.current,
-      contacts: next
+      contacts: snapshot
     };
-    setContacts(next);
+    setContacts(snapshot);
   }
 
   // 담당자 탭 저장 버튼 — 즉시 Supabase push (디바운스 없음)
   async function forceSaveContacts(nextContacts) {
+    const snapshot = prepareContactSnapshot(nextContacts);
     localDirtyRef.current = true;
     dataRef.current = {
       ...dataRef.current,
-      contacts: nextContacts
+      contacts: snapshot
     }; // pull 경쟁 방지
-    setContacts(nextContacts);
+    setContacts(snapshot);
     if (!navigator.onLine) {
       setSyncStatus("offline");
       throw new Error("오프라인 상태입니다.");
@@ -3803,7 +3877,17 @@ function App() {
           entries: e,
           cats: c
         } = dataRef.current;
-        await withRetry(() => sbPush(e, c, nextContacts));
+        const remote = await withRetry(sbPull);
+        const mergedEntries = mergeRecords(e, remote?.entries || [], migrateEntry, true);
+        const mergedContacts = mergeRecords(snapshot, remote?.contacts || [], migrateContact, true);
+        await withRetry(() => sbPush(mergedEntries, c, mergedContacts));
+        dataRef.current = {
+          entries: mergedEntries,
+          cats: c,
+          contacts: mergedContacts
+        };
+        setEntries(mergedEntries);
+        setContacts(mergedContacts);
         localDirtyRef.current = false;
         setSyncStatus("ok");
       });
@@ -3815,12 +3899,14 @@ function App() {
   }
 
   // ── 필터/정렬 ────────────────────────────────────────
+  const liveEntries = entries.filter(isLiveRecord);
+  const liveContacts = contacts.filter(isLiveRecord).sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER));
   const counts = {};
   cats.forEach(c => {
-    counts[c.id] = entries.filter(e => e.category === c.id && !e.done).length;
+    counts[c.id] = liveEntries.filter(e => e.category === c.id && !e.done).length;
   });
-  const totalActive = entries.filter(e => !e.done).length;
-  const filtered = entries.filter(e => {
+  const totalActive = liveEntries.filter(e => !e.done).length;
+  const filtered = liveEntries.filter(e => {
     if (!showDone && e.done) return false;
     if (catFilter !== "all" && e.category !== catFilter) return false;
     if (search) {
@@ -3873,7 +3959,7 @@ function App() {
       fontSize: 15,
       color: "#888"
     }
-  }, "불러오는 중...");
+  }, "\uBD88\uB7EC\uC624\uB294 \uC911...");
   return /*#__PURE__*/React.createElement("div", {
     style: {
       fontFamily: "'Noto Sans KR','Apple SD Gothic Neo',sans-serif",
@@ -3888,6 +3974,7 @@ function App() {
       zIndex: 200
     }
   }, /*#__PURE__*/React.createElement("header", {
+    className: "app-header",
     style: {
       background: "#1a1a2e",
       color: "#fff",
@@ -3899,6 +3986,7 @@ function App() {
       boxShadow: "0 2px 8px rgba(0,0,0,0.3)"
     }
   }, /*#__PURE__*/React.createElement("div", {
+    className: "app-header-left",
     style: {
       display: "flex",
       alignItems: "center",
@@ -3915,23 +4003,27 @@ function App() {
       padding: "4px 6px",
       lineHeight: 1
     }
-  }, "☰"), /*#__PURE__*/React.createElement("span", {
+  }, "\u2630"), /*#__PURE__*/React.createElement("span", {
+    className: "app-title",
     style: {
       fontSize: 17,
       fontWeight: 700
     }
-  }, "📋 업무수첩")), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCCB \uC5C5\uBB34\uC218\uCCA9")), /*#__PURE__*/React.createElement("div", {
+    className: "app-header-actions",
     style: {
       display: "flex",
       alignItems: "center",
       gap: 8
     }
   }, /*#__PURE__*/React.createElement("span", {
+    className: "header-count",
     style: {
       fontSize: 11,
       color: "#aaa"
     }
-  }, totalActive, "건"), /*#__PURE__*/React.createElement("button", {
+  }, totalActive, "\uAC74"), /*#__PURE__*/React.createElement("button", {
+    className: "header-action",
     onClick: manualSync,
     title: syncStatus === "error" ? "동기화 오류 — 클릭하여 재시도" : syncStatus === "offline" ? "오프라인 — 연결되면 자동 동기화" : "지금 동기화",
     style: {
@@ -3952,11 +4044,13 @@ function App() {
       animation: syncStatus === "syncing" ? "spin 1s linear infinite" : "none"
     }
   }, syncStatus === "syncing" ? "⟳" : syncStatus === "ok" ? "☁" : syncStatus === "error" ? "⚠" : syncStatus === "offline" ? "⚡" : "☁"), /*#__PURE__*/React.createElement("span", {
+    className: "sync-label",
     style: {
       fontSize: 10
     }
   }, syncStatus === "syncing" ? "동기화중" : syncStatus === "ok" ? "동기화됨" : syncStatus === "error" ? "오류" : syncStatus === "offline" ? "오프라인" : "동기화")), /*#__PURE__*/React.createElement("button", {
-    onClick: () => exportXLSX(entries, cats, contacts),
+    className: "header-action",
+    onClick: () => exportXLSX(liveEntries, cats, liveContacts),
     style: {
       padding: "7px 10px",
       background: "#27ae60",
@@ -3967,7 +4061,8 @@ function App() {
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "📊 엑셀"), /*#__PURE__*/React.createElement("button", {
+  }, "\uD83D\uDCCA \uC5D1\uC140"), /*#__PURE__*/React.createElement("button", {
+    className: "header-action",
     onClick: openNew,
     style: {
       padding: "7px 12px",
@@ -3979,9 +4074,9 @@ function App() {
       fontWeight: 700,
       cursor: "pointer"
     }
-  }, "+ 추가"))), selActive && /*#__PURE__*/React.createElement(SelectionBar, {
+  }, "+ \uCD94\uAC00"))), selActive && /*#__PURE__*/React.createElement(SelectionBar, {
     selected: selected,
-    entries: entries,
+    entries: liveEntries,
     cats: cats,
     barRef: selBarRef,
     onClear: () => setSelected(new Set()),
@@ -4016,14 +4111,14 @@ function App() {
       color: "#555",
       fontWeight: 700
     }
-  }, "📋 분류로 바로가기"), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDCCB \uBD84\uB958\uB85C \uBC14\uB85C\uAC00\uAE30"), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "0 14px 10px",
       fontSize: 11,
       color: "#aaa",
       lineHeight: 1.5
     }
-  }, "탭을 누르면 해당 분류만 표시됩니다"), [{
+  }, "\uD0ED\uC744 \uB204\uB974\uBA74 \uD574\uB2F9 \uBD84\uB958\uB9CC \uD45C\uC2DC\uB429\uB2C8\uB2E4"), [{
     id: "all",
     label: "전체",
     icon: "◈",
@@ -4088,7 +4183,7 @@ function App() {
       color: "#555",
       fontWeight: 600
     }
-  }, "⚙️ 분류 관리"), /*#__PURE__*/React.createElement("button", {
+  }, "\u2699\uFE0F \uBD84\uB958 \uAD00\uB9AC"), /*#__PURE__*/React.createElement("button", {
     onClick: () => {
       setShowPwModal(true);
       setShowSidebar(false);
@@ -4122,7 +4217,7 @@ function App() {
       width: 16,
       height: 16
     }
-  }), "완료 항목 보기")))), /*#__PURE__*/React.createElement("div", {
+  }), "\uC644\uB8CC \uD56D\uBAA9 \uBCF4\uAE30")))), /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fff",
       borderBottom: "1px solid #e0e0da",
@@ -4147,31 +4242,31 @@ function App() {
       cursor: "pointer",
       padding: "2px 6px"
     }
-  }, "✕ 전체보기")), tab === "date" && /*#__PURE__*/React.createElement("span", {
+  }, "\u2715 \uC804\uCCB4\uBCF4\uAE30")), tab === "date" && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       fontWeight: 700,
       color: "#1a1a2e"
     }
-  }, "📅 날짜별"), tab === "tag" && /*#__PURE__*/React.createElement("span", {
+  }, "\uD83D\uDCC5 \uB0A0\uC9DC\uBCC4"), tab === "tag" && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       fontWeight: 700,
       color: "#1a1a2e"
     }
-  }, "🏷️ 태그별"), tab === "paste" && /*#__PURE__*/React.createElement("span", {
+  }, "\uD83C\uDFF7\uFE0F \uD0DC\uADF8\uBCC4"), tab === "paste" && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       fontWeight: 700,
       color: "#1a1a2e"
     }
-  }, "✏️ 텍스트 입력"), tab === "contact" && /*#__PURE__*/React.createElement("span", {
+  }, "\u270F\uFE0F \uD14D\uC2A4\uD2B8 \uC785\uB825"), tab === "contact" && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       fontWeight: 700,
       color: "#1a1a2e"
     }
-  }, "👤 담당자"))), /*#__PURE__*/React.createElement("div", {
+  }, "\uD83D\uDC64 \uB2F4\uB2F9\uC790"))), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "14px 14px 80px",
       maxWidth: 700,
@@ -4198,10 +4293,10 @@ function App() {
       fontSize: 14,
       pointerEvents: "none"
     }
-  }, "🔍"), /*#__PURE__*/React.createElement("input", {
+  }, "\uD83D\uDD0D"), /*#__PURE__*/React.createElement("input", {
     value: search,
     onChange: e => setSearch(e.target.value),
-    placeholder: "검색...",
+    placeholder: "\uAC80\uC0C9...",
     style: {
       width: "100%",
       padding: "10px 10px 10px 34px",
@@ -4224,11 +4319,11 @@ function App() {
     }
   }, /*#__PURE__*/React.createElement("option", {
     value: "priority"
-  }, "마감임박순"), /*#__PURE__*/React.createElement("option", {
+  }, "\uB9C8\uAC10\uC784\uBC15\uC21C"), /*#__PURE__*/React.createElement("option", {
     value: "date_desc"
-  }, "최신순"), /*#__PURE__*/React.createElement("option", {
+  }, "\uCD5C\uC2E0\uC21C"), /*#__PURE__*/React.createElement("option", {
     value: "date_asc"
-  }, "오래된순"))), tab === "list" && (filtered.length === 0 ? /*#__PURE__*/React.createElement(Empty, null) : /*#__PURE__*/React.createElement("div", {
+  }, "\uC624\uB798\uB41C\uC21C"))), tab === "list" && (filtered.length === 0 ? /*#__PURE__*/React.createElement(Empty, null) : /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -4244,7 +4339,7 @@ function App() {
     onDelete: deleteEntry,
     onToggle: toggleDone
   })))), tab === "date" && /*#__PURE__*/React.createElement(DateView, {
-    entries: entries,
+    entries: liveEntries,
     cats: cats,
     selected: selected,
     onSelect: toggleSelect,
@@ -4252,7 +4347,7 @@ function App() {
     onDelete: deleteEntry,
     onToggle: toggleDone
   }), tab === "tag" && /*#__PURE__*/React.createElement(TagView, {
-    entries: entries,
+    entries: liveEntries,
     cats: cats,
     selected: selected,
     onSelect: toggleSelect,
@@ -4263,7 +4358,7 @@ function App() {
     cats: cats,
     onAddEntry: addEntry
   }), tab === "contact" && /*#__PURE__*/React.createElement(ContactTab, {
-    contacts: contacts,
+    contacts: liveContacts,
     onSave: saveContacts,
     onForceSave: forceSaveContacts
   })), tab !== "paste" && tab !== "contact" && /*#__PURE__*/React.createElement("button", {

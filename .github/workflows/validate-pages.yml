@@ -1,0 +1,35 @@
+name: Validate GitHub Pages build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install build dependency
+        run: npm install --ignore-scripts
+
+      - name: Rebuild deployable HTML
+        run: npm run build
+
+      - name: Verify generated index.html is committed
+        run: git diff --exit-code -- index.html
+
+      - name: Validate deployment structure
+        run: python3 scripts/validate_index.py
+
+      - name: Test sync merge rules
+        run: npm run test:sync

@@ -1,0 +1,13 @@
+{
+  "name": "workbook-pages",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "validate": "python3 scripts/validate_index.py",
+    "test:sync": "node scripts/test_sync_model.mjs"
+  },
+  "devDependencies": {
+    "@babel/standalone": "7.28.5"
+  }
+}

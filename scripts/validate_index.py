@@ -7,6 +7,9 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 INDEX = ROOT / "index.html"
+SOURCE = ROOT / "src" / "index.html"
+BUILD_SCRIPT = ROOT / "scripts" / "build.mjs"
+PACKAGE = ROOT / "package.json"
 
 
 def fail(message: str) -> None:
@@ -17,8 +20,13 @@ def fail(message: str) -> None:
 def main() -> None:
     if not INDEX.exists():
         fail("index.html is missing")
+    if not SOURCE.exists():
+        fail("src/index.html is missing")
+    if not BUILD_SCRIPT.exists() or not PACKAGE.exists():
+        fail("The reproducible build files are missing")
 
     html = INDEX.read_text(encoding="utf-8")
+    source = SOURCE.read_text(encoding="utf-8")
     checks = [
         ('type="text/babel"', "Do not deploy JSX that must be compiled in the browser."),
         ("type='text/babel'", "Do not deploy JSX that must be compiled in the browser."),
@@ -41,7 +49,13 @@ def main() -> None:
     if len(html) < 20_000:
         fail("index.html is unexpectedly small; verify the app content was not truncated.")
 
-    print("OK: index.html is precompiled and ready for GitHub Pages.")
+    if 'type="text/babel"' not in source:
+        fail("src/index.html must remain the editable JSX source")
+
+    if "scripts/build.mjs" not in PACKAGE.read_text(encoding="utf-8"):
+        fail("package.json does not point to the build script")
+
+    print("OK: source/build structure is complete and index.html is ready for GitHub Pages.")
 
 
 if __name__ == "__main__":
