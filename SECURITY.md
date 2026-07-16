@@ -1,19 +1,23 @@
 # 보안 검토
 
-## 현재 상태
+## 개편 후 상태
 
-- Supabase anon key는 브라우저 앱에 포함되는 공개 키이므로 소스 노출 자체는 문제가 아닙니다.
-- 다만 현재 `workbook_sync`의 `main` 행은 anon 역할로 읽을 수 있습니다.
-- 앱의 화면 잠금은 로컬 편의 기능이며 클라우드 데이터 접근 제어 또는 데이터 암호화가 아닙니다.
-- 로컬 화면 잠금 비밀번호는 SHA-256 해시로 저장되며, 기존 평문 값은 첫 성공 로그인 때 자동 변환됩니다.
+- Supabase anon key는 브라우저 앱에 포함되는 공개 키입니다. 노출 자체는 문제가 아니며, 접근 제어는 Supabase Auth와 RLS가 담당합니다.
+- 앱은 Supabase Auth 로그인 후에만 열립니다.
+- 업무 항목, 분류, 담당자는 `user_id = auth.uid()` 조건의 RLS 정책으로 보호됩니다.
+- 사진/첨부는 private Storage bucket `workbook`에 `사용자 UUID/파일명` 경로로 저장됩니다.
+- 앱은 DB에 Storage path를 저장하고, 화면 표시 시 24시간 signed URL을 발급합니다.
+- IndexedDB 캐시는 로그인 사용자 ID가 바뀌면 초기화됩니다.
 
-## 필수 후속 작업
+## 기존 데이터 이관
 
-Supabase Auth를 연결하고 `workbook_sync`와 Storage 버킷에 사용자별 RLS 정책을 적용해야 합니다.
-이 작업은 다음 정보와 함께 별도 마이그레이션으로 수행합니다.
+- `workbook_sync/main`은 신규 계정의 첫 로그인 때 한 번만 읽어 신규 row 테이블로 이관합니다.
+- 이관 확인 전까지는 `workbook_sync_legacy_migration_read` 정책을 임시로 유지합니다.
+- 이관 확인 후 `supabase/migrations/20260619_lock_legacy.sql`을 실행해 legacy read 정책을 제거합니다.
+- Supabase Dashboard에 과거 anon/public SELECT policy가 남아 있으면 수동 제거해야 합니다.
 
-1. 사용할 Supabase 로그인 이메일
-2. 여러 기기에서 동일 계정으로 로그인할지 여부
-3. 기존 `main` 행과 Storage 파일의 소유자 마이그레이션 승인
+## 운영 주의
 
-RLS 정책만 먼저 잠그면 현재 앱의 동기화가 중단되므로, Auth UI와 데이터 마이그레이션을 같은 배포에서 적용해야 합니다.
+- GitHub Pages는 정적 호스팅이므로 비밀키(service role key)를 절대 넣지 않습니다.
+- Storage signed URL은 공유되면 만료 전까지 열람 가능하므로 민감한 파일은 URL을 외부에 전달하지 않는 것이 좋습니다.
+- 무료 플랜 용량을 넘기지 않도록 대용량 영상/압축파일 업로드는 피하는 편이 안전합니다.

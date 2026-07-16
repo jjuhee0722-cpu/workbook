@@ -199,36 +199,51 @@ async function withRetry(fn, { tries = 3, base = 600 } = {}) {
   throw lastErr;
 }
 
-// 우리가 마지막으로 기록한 synced_at 토큰 — 자기 자신이 만든 실시간 이벤트(메아리)를 무시하기 위함
-let _lastWriteToken = 0;
+const ROW_TABLES = {
+  profile: "workbook_profiles",
+  entries: "workbook_entries",
+  cats: "workbook_categories",
+  contacts: "workbook_contacts",
+};
 
-async function sbPull() {
-  if (!sb) throw new Error("Supabase client unavailable");
-  // maybeSingle: 행이 없으면 에러 대신 null 반환 (첫 사용 대응)
-  const { data, error } = await sb.from("workbook_sync").select("*").eq("id", "main").maybeSingle();
-  if (error) throw error;
-  return data;
+// 내가 방금 저장해서 되돌아오는 realtime 이벤트는 잠깐 무시한다.
+let _syncMuteUntil = 0;
+let _baseline = { entries:new Map(), cats:new Map(), contacts:new Map() };
+
+function syncSetupError(error) {
+  const msg = error && (error.message || error.details || String(error));
+  if (msg && /workbook_(profiles|entries|categories|contacts)|does not exist|schema cache/i.test(msg)) {
+    return new Error("새 동기화 테이블이 아직 준비되지 않았습니다. Supabase SQL 마이그레이션을 먼저 적용해 주세요.");
+  }
+  return error;
 }
 
-async function sbPush(entries, cats, contacts) {
-  if (!sb) throw new Error("Supabase client unavailable");
-  const token = Date.now();
-  const { error } = await sb.from("workbook_sync").upsert({
-    id: "main",
-    entries,
-    cats,
-    contacts,
-    synced_at: token,
-  });
-  if (error) throw error;
-  _lastWriteToken = token;   // 직후 들어올 자기 메아리 이벤트를 식별하는 데 사용
-  return token;
+function stableJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "["+value.map(stableJson).join(",")+"]";
+  return "{"+Object.keys(value).sort().map(k=>JSON.stringify(k)+":"+stableJson(value[k])).join(",")+"}";
 }
-
-// 대략적인 페이로드 크기(바이트) — 사진·첨부 base64가 한도를 넘는지 점검
-function approxPayloadBytes(entries, cats, contacts) {
-  try { return new Blob([JSON.stringify({ entries, cats, contacts })]).size; }
-  catch { return 0; }
+function cleanPayload(value) {
+  if (Array.isArray(value)) return value.map(cleanPayload);
+  if (value && typeof value === "object") {
+    const out = {};
+    Object.keys(value).forEach(k => {
+      const v = value[k];
+      if (v !== undefined) out[k] = cleanPayload(v);
+    });
+    return out;
+  }
+  return value;
+}
+function makeBaseline(entries, cats, contacts) {
+  const toMap = arr => new Map((arr||[]).map(item => [item.id, stableJson(cleanPayload(item))]));
+  return { entries:toMap(entries), cats:toMap(cats), contacts:toMap(contacts) };
+}
+function rowToPayload(row, migrate) {
+  return migrate({ id: row.id, ...(row.payload || {}), updatedAt: Number(row.updated_at || row.payload?.updatedAt || 0), deletedAt: Number(row.deleted_at || row.payload?.deletedAt || 0) });
+}
+function orderedRows(rows, migrate) {
+  return (rows||[]).map(row => rowToPayload(row, migrate));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -269,34 +284,99 @@ function fileToB64(file) {
 function fileToAttachment(file) {
   return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=e=>res({name:file.name,type:file.type,size:file.size,data:e.target.result}); r.onerror=rej; r.readAsDataURL(file); });
 }
+function dataUrlFile(dataUrl, name="legacy-file") {
+  const [head, body] = String(dataUrl||"").split(",");
+  const mime = (head.match(/data:([^;]+)/)||[])[1] || "application/octet-stream";
+  const bin = atob(body || "");
+  const bytes = new Uint8Array(bin.length);
+  for (let i=0; i<bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return new File([bytes], name, { type:mime });
+}
 
 // ── Supabase Storage 업로드 ───────────────────────────────
-// 사진·첨부를 한 행에 base64로 욱여넣지 않고 Storage 버킷에 올린 뒤 URL만 저장(정석).
-// 버킷 미설정 등으로 업로드 실패 시 base64로 자동 폴백 → 앱은 절대 멈추지 않음.
+// 사진·첨부는 DB에 base64로 넣지 않고 private Storage에 저장하고, DB에는 path만 둔다.
 const SB_BUCKET = "workbook";
 async function sbUpload(file) {
   if (!sb) throw new Error("Supabase client unavailable");
+  const { data: sessionData } = await sb.auth.getSession();
+  const userId = sessionData?.session?.user?.id;
+  if (!userId) throw new Error("로그인이 필요합니다.");
   const safe = (file.name||"file").replace(/[^\w.\-]/g,"_").slice(-40);
-  const path = `${Date.now()}_${Math.random().toString(36).slice(2,8)}_${safe}`;
+  const path = `${userId}/${Date.now()}_${Math.random().toString(36).slice(2,8)}_${safe}`;
   const { error } = await sb.storage.from(SB_BUCKET).upload(path, file, {
     cacheControl: "31536000", upsert: false, contentType: file.type || undefined,
   });
   if (error) throw error;
-  const { data } = sb.storage.from(SB_BUCKET).getPublicUrl(path);
-  return { url: data.publicUrl, path };
+  const { data, error: signError } = await sb.storage.from(SB_BUCKET).createSignedUrl(path, 60 * 60 * 24);
+  if (signError) throw signError;
+  return { url: data.signedUrl, path };
 }
-// 사진 1장 → URL 문자열 (실패 시 base64 data URL)
 async function uploadPhoto(file) {
-  try { const { url } = await sbUpload(file); return url; }
-  catch (e) { console.warn("[storage] 사진 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToB64(file); }
+  const asset = await sbUpload(file);
+  return { url: asset.url, path: asset.path };
 }
-// 첨부 1개 → {name,type,size,url} (실패 시 base64 data 보유 객체)
 async function uploadAttachment(file) {
-  try { const { url } = await sbUpload(file); return { name:file.name, type:file.type, size:file.size, url }; }
-  catch (e) { console.warn("[storage] 첨부 업로드 실패 → base64 임시 저장:", e && e.message); return await fileToAttachment(file); }
+  const asset = await sbUpload(file);
+  return { name:file.name, type:file.type, size:file.size, url:asset.url, path:asset.path };
 }
 // 첨부/사진 소스 추출 (신규 url 우선, 구버전 base64 호환)
 const attSrc = a => a && (a.url || a.data) || "";
+const photoSrc = p => (p && typeof p === "object") ? (p.url || p.data || "") : (p || "");
+
+async function createSignedUrls(records) {
+  if (!sb) return records;
+  const paths = [];
+  const visit = value => {
+    if (Array.isArray(value)) value.forEach(visit);
+    else if (value && typeof value === "object") {
+      if (value.path && !String(value.url||"").startsWith("data:")) paths.push(value.path);
+      Object.values(value).forEach(visit);
+    }
+  };
+  visit(records);
+  const unique = [...new Set(paths)];
+  if (!unique.length) return records;
+  const { data, error } = await sb.storage.from(SB_BUCKET).createSignedUrls(unique, 60 * 60 * 24);
+  if (error) { console.warn("[storage] signed url 생성 실패:", error.message); return records; }
+  const urlByPath = new Map((data||[]).filter(x=>x.signedUrl).map(x=>[x.path, x.signedUrl]));
+  const hydrate = value => {
+    if (Array.isArray(value)) return value.map(hydrate);
+    if (value && typeof value === "object") {
+      const out = {};
+      Object.keys(value).forEach(k => out[k] = hydrate(value[k]));
+      if (out.path && urlByPath.has(out.path)) out.url = urlByPath.get(out.path);
+      return out;
+    }
+    return value;
+  };
+  return hydrate(records);
+}
+
+async function migrateEmbeddedAssets(records) {
+  const migratePhoto = async photo => {
+    if (typeof photo === "string" && photo.startsWith("data:")) {
+      const file = dataUrlFile(photo, "legacy-photo.jpg");
+      return await uploadPhoto(file);
+    }
+    return photo;
+  };
+  const migrateAttachment = async att => {
+    if (att?.data && String(att.data).startsWith("data:") && !att.path) {
+      const file = dataUrlFile(att.data, att.name || "legacy-attachment");
+      const uploaded = await uploadAttachment(file);
+      return { ...att, data:undefined, ...uploaded };
+    }
+    return att;
+  };
+  const next = [];
+  for (const record of records || []) {
+    const copy = { ...record };
+    if (copy.photos) copy.photos = await Promise.all(copy.photos.map(migratePhoto));
+    if (copy.attachments) copy.attachments = await Promise.all(copy.attachments.map(migrateAttachment));
+    next.push(copy);
+  }
+  return next;
+}
 
 function fmtSize(b){ return b<1024?b+"B":b<1048576?(b/1024).toFixed(1)+"KB":(b/1048576).toFixed(1)+"MB"; }
 function attachIcon(t){
@@ -348,6 +428,93 @@ function sameRecords(a,b,migrate) {
   const normalize=list=>(list||[]).map(migrate).sort((x,y)=>String(x.id).localeCompare(String(y.id)));
   return JSON.stringify(normalize(a))===JSON.stringify(normalize(b));
 }
+
+async function sbPullRows(userId) {
+  if (!sb) throw new Error("Supabase client unavailable");
+  try {
+    const [entryRes, catRes, contactRes, profileRes] = await Promise.all([
+      sb.from(ROW_TABLES.entries).select("id,payload,updated_at,deleted_at").eq("user_id", userId),
+      sb.from(ROW_TABLES.cats).select("id,payload,sort_order,updated_at").eq("user_id", userId).order("sort_order", { ascending:true }),
+      sb.from(ROW_TABLES.contacts).select("id,payload,sort_order,updated_at,deleted_at").eq("user_id", userId).order("sort_order", { ascending:true }),
+      sb.from(ROW_TABLES.profile).select("legacy_migrated").eq("user_id", userId).maybeSingle(),
+    ]);
+    for (const res of [entryRes, catRes, contactRes, profileRes]) if (res.error) throw res.error;
+
+    let entries = orderedRows(entryRes.data, migrateEntry);
+    let cats = orderedRows(catRes.data, x=>x);
+    let contacts = orderedRows(contactRes.data, migrateContact);
+    let migrated = !!profileRes.data?.legacy_migrated;
+
+    if (!migrated && !entries.length && !contacts.length && !cats.length) {
+      const legacy = await sb.from("workbook_sync").select("*").eq("id", "main").maybeSingle();
+      if (legacy.error && legacy.error.code !== "PGRST116") throw legacy.error;
+      if (legacy.data) {
+        entries = await migrateEmbeddedAssets((legacy.data.entries||[]).map(migrateEntry));
+        contacts = await migrateEmbeddedAssets((legacy.data.contacts||[]).map(migrateContact));
+        cats = legacy.data.cats?.length ? legacy.data.cats : DEFAULT_CATS;
+        await sbPushRows(userId, entries, cats, contacts, makeBaseline([], [], []), true);
+      }
+      await sb.from(ROW_TABLES.profile).upsert({
+        user_id:userId,
+        legacy_migrated:true,
+        migrated_at:new Date().toISOString(),
+      });
+    }
+
+    const hydrated = await createSignedUrls({ entries, contacts });
+    entries = hydrated.entries || entries;
+    contacts = hydrated.contacts || contacts;
+    const result = { entries, cats: cats.length ? cats : DEFAULT_CATS, contacts };
+    _baseline = makeBaseline(result.entries, result.cats, result.contacts);
+    return result;
+  } catch (error) {
+    throw syncSetupError(error);
+  }
+}
+
+function changedRows(list, baselineMap, forceAll=false) {
+  return (list||[])
+    .map((item,index)=>({ item, index, json:stableJson(cleanPayload(item)) }))
+    .filter(row => forceAll || baselineMap.get(row.item.id) !== row.json);
+}
+function removedIds(baselineMap, list) {
+  const live = new Set((list||[]).map(item=>item.id));
+  return [...baselineMap.keys()].filter(id => !live.has(id));
+}
+
+async function sbPushRows(userId, entries, cats, contacts, baseline=_baseline, forceAll=false) {
+  if (!sb) throw new Error("Supabase client unavailable");
+  try {
+    const entryChanges = changedRows(entries, baseline.entries, forceAll);
+    const catChanges = changedRows(cats, baseline.cats, forceAll);
+    const contactChanges = changedRows(contacts, baseline.contacts, forceAll);
+    const catDeletes = removedIds(baseline.cats, cats);
+
+    const calls = [];
+    if (entryChanges.length) calls.push(sb.from(ROW_TABLES.entries).upsert(entryChanges.map(({item})=>({
+      user_id:userId, id:item.id, payload:cleanPayload(item),
+      updated_at:Number(item.updatedAt||0), deleted_at:Number(item.deletedAt||0),
+    }))));
+    if (catChanges.length) calls.push(sb.from(ROW_TABLES.cats).upsert(catChanges.map(({item,index})=>({
+      user_id:userId, id:item.id, payload:cleanPayload(item),
+      sort_order:index, updated_at:Date.now(),
+    }))));
+    if (contactChanges.length) calls.push(sb.from(ROW_TABLES.contacts).upsert(contactChanges.map(({item,index})=>({
+      user_id:userId, id:item.id, payload:cleanPayload(item),
+      sort_order:Number(item.order ?? index), updated_at:Number(item.updatedAt||0), deleted_at:Number(item.deletedAt||0),
+    }))));
+    if (catDeletes.length) calls.push(sb.from(ROW_TABLES.cats).delete().eq("user_id", userId).in("id", catDeletes));
+    const results = await Promise.all(calls);
+    const failed = results.find(res=>res.error);
+    if (failed) throw failed.error;
+    _baseline = makeBaseline(entries, cats, contacts);
+    _syncMuteUntil = Date.now() + 2500;
+    return Date.now();
+  } catch (error) {
+    throw syncSetupError(error);
+  }
+}
+
 function getDday(dl) {
   if(!dl) return null;
   const t=new Date(); t.setHours(0,0,0,0);
@@ -516,8 +683,8 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
   const bodyRef  = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
-  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
-  async function addFiles(files){ setUploading(true); try{ const atts=await Promise.all(Array.from(files).map(uploadAttachment)); setForm(p=>({...p,attachments:[...(p.attachments||[]),...atts]})); } finally{ setUploading(false); } }
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } catch(e){ alert("사진 업로드 실패: "+(e?.message||e)); } finally{ setUploading(false); } }
+  async function addFiles(files){ setUploading(true); try{ const atts=await Promise.all(Array.from(files).map(uploadAttachment)); setForm(p=>({...p,attachments:[...(p.attachments||[]),...atts]})); } catch(e){ alert("첨부 업로드 실패: "+(e?.message||e)); } finally{ setUploading(false); } }
   const autoResize = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(120,el.scrollHeight)+"px"; };
   useEffect(()=>{ autoResize(bodyRef.current); },[]);
 
@@ -554,7 +721,7 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
           {(form.photos||[]).map((src,i)=>(
             <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
-              <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+              <img src={photoSrc(src)} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
               <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
                 style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
             </div>
@@ -924,7 +1091,7 @@ function ContactForm({initial,onSubmit,onCancel}) {
   const [uploading,setUploading] = useState(false);
   const photoRef = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
-  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } finally{ setUploading(false); } }
+  async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } catch(e){ alert("사진 업로드 실패: "+(e?.message||e)); } finally{ setUploading(false); } }
   const fields=[
     {key:"company",label:"🏢 회사",   placeholder:"소속 기관 / 회사명"},
     {key:"title",  label:"🪪 직함",   placeholder:"직위 / 직책"},
@@ -942,7 +1109,7 @@ function ContactForm({initial,onSubmit,onCancel}) {
       <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:14,alignItems:"flex-start"}}>
         {(form.photos||[]).map((src,i)=>(
           <div key={i} style={{position:"relative",display:"inline-block",flexShrink:0}}>
-            <img src={src} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
+            <img src={photoSrc(src)} style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #ddd",display:"block"}}/>
             <button onClick={()=>f("photos",(form.photos||[]).filter((_,j)=>j!==i))}
               style={{position:"absolute",top:-7,right:-7,background:"#e74c3c",color:"#fff",border:"none",borderRadius:"50%",width:20,height:20,cursor:"pointer",fontSize:12,display:"flex",alignItems:"center",justifyContent:"center",padding:0,lineHeight:1}}>✕</button>
           </div>
@@ -1088,7 +1255,7 @@ function PhotoViewer({photos, startIndex, onClose}) {
 
   function download(e) {
     e.stopPropagation();
-    const src=photos[idx];
+    const src=photoSrc(photos[idx]);
     if(src.startsWith("data:")){
       const ext=(src.match(/data:image\/(\w+)/)?.[1]||"jpeg").replace("jpeg","jpg");
       const a=document.createElement("a"); a.href=src; a.download="사진_"+(idx+1)+"."+ext;
@@ -1116,7 +1283,7 @@ function PhotoViewer({photos, startIndex, onClose}) {
         {/* 이미지 */}
         <div style={{overflow:"hidden",width:"95vw",maxHeight:"70vh",display:"flex",alignItems:"center",justifyContent:"center",borderRadius:10}}
           onWheel={onWheel} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
-          <img src={photos[idx]} alt={"사진 "+(idx+1)}
+          <img src={photoSrc(photos[idx])} alt={"사진 "+(idx+1)}
             style={{maxWidth:"95vw",maxHeight:"70vh",objectFit:"contain",borderRadius:8,display:"block",
               transform:"scale("+scale+")",transformOrigin:"center",transition:"transform 0.05s",userSelect:"none",WebkitUserSelect:"none"}}/>
         </div>
@@ -1148,7 +1315,7 @@ function PhotoGallery({photos, thumbStyle}) {
     <>
       <div style={{display:"flex",gap:6,flexWrap:"wrap",marginTop:8}}>
         {photos.map((src,i)=>(
-          <img key={i} src={src} alt={"사진"+(i+1)}
+          <img key={i} src={photoSrc(src)} alt={"사진"+(i+1)}
             style={{width:72,height:72,objectFit:"cover",borderRadius:6,border:"1px solid #eee",cursor:"zoom-in",display:"block",...thumbStyle}}
             onClick={()=>setViewIdx(i)}/>
         ))}
@@ -1299,7 +1466,63 @@ function LockScreen({onUnlock}) {
 // ══════════════════════════════════════════════════════════
 //  메인 앱
 // ══════════════════════════════════════════════════════════
-function App() {
+function AuthGate() {
+  const [session, setSession] = useState(null);
+  const [ready, setReady] = useState(false);
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  useEffect(()=>{
+    if(!sb){ setReady(true); return; }
+    sb.auth.getSession().then(({data})=>{ setSession(data.session || null); setReady(true); });
+    const { data: sub } = sb.auth.onAuthStateChange((_event, next)=>setSession(next));
+    return ()=>sub.subscription.unsubscribe();
+  },[]);
+
+  async function submit() {
+    if(!email.trim() || password.length < 6){ setMsg("이메일과 6자리 이상 비밀번호를 입력해 주세요."); return; }
+    setBusy(true); setMsg("");
+    try{
+      const payload = { email:email.trim(), password };
+      const res = mode==="signup"
+        ? await sb.auth.signUp({ ...payload, options:{ emailRedirectTo:location.origin + location.pathname } })
+        : await sb.auth.signInWithPassword(payload);
+      if(res.error) throw res.error;
+      setMsg(mode==="signup" ? "가입 메일이 발송됐습니다. 메일 확인 후 로그인해 주세요." : "");
+    }catch(e){ setMsg(e?.message || String(e)); }
+    finally{ setBusy(false); }
+  }
+
+  if(!ready) return <div style={{display:"flex",alignItems:"center",justifyContent:"center",height:"100vh",color:"#888"}}>로그인 상태 확인 중...</div>;
+  if(!sb) return <div style={{padding:24,color:"#c0392b"}}>Supabase 연결을 초기화하지 못했습니다.</div>;
+  if(session?.user) return <App user={session.user}/>;
+
+  return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#f2f2ef",padding:20,fontFamily:"'Noto Sans KR','Apple SD Gothic Neo',sans-serif"}}>
+      <div style={{width:"100%",maxWidth:380,background:"#fff",borderRadius:18,padding:24,boxShadow:"0 12px 40px rgba(0,0,0,0.12)"}}>
+        <div style={{fontSize:24,fontWeight:800,color:"#1a1a2e",marginBottom:6}}>📋 업무수첩</div>
+        <div style={{fontSize:13,color:"#777",lineHeight:1.6,marginBottom:18}}>이제 업무수첩은 로그인 계정별로 안전하게 동기화됩니다.</div>
+        <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="이메일" autoComplete="email"
+          style={{width:"100%",padding:"12px",border:"1px solid #ddd",borderRadius:10,marginBottom:10,fontSize:14}}/>
+        <input type="password" value={password} onChange={e=>setPassword(e.target.value)} onKeyDown={e=>e.key==="Enter"&&submit()} placeholder="비밀번호"
+          autoComplete={mode==="signup"?"new-password":"current-password"}
+          style={{width:"100%",padding:"12px",border:"1px solid #ddd",borderRadius:10,marginBottom:12,fontSize:14}}/>
+        {msg&&<div style={{fontSize:12,color:msg.includes("발송")?"#27ae60":"#c0392b",lineHeight:1.5,marginBottom:10}}>{msg}</div>}
+        <button onClick={submit} disabled={busy} style={{width:"100%",padding:"13px",border:"none",borderRadius:10,background:"#1a1a2e",color:"#fff",fontSize:15,fontWeight:800,cursor:busy?"default":"pointer",opacity:busy?0.7:1}}>
+          {busy?"처리 중...":mode==="signup"?"회원가입":"로그인"}
+        </button>
+        <button onClick={()=>{setMode(m=>m==="signup"?"signin":"signup");setMsg("");}} style={{width:"100%",marginTop:10,padding:"11px",border:"1px solid #ddd",borderRadius:10,background:"#fff",color:"#555",fontSize:13,cursor:"pointer"}}>
+          {mode==="signup"?"이미 계정이 있어요":"처음이면 회원가입"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function App({user}) {
   const [entries,    setEntries]    = useState([]);
   const [cats,       setCats]       = useState(DEFAULT_CATS);
   const [contacts,   setContacts]   = useState([]);
@@ -1323,18 +1546,25 @@ function App() {
   useEffect(()=>{
     (async()=>{
       try {
-        const [ents,savedCats,savedContacts]=await Promise.all([
+        const [ents,savedCats,savedContacts,savedUser]=await Promise.all([
           idbGetAll(STORES.entries),
           idbGetMeta("cats"),
           idbGetAll(STORES.contacts),
+          idbGetMeta("user_id"),
         ]);
-        if(ents.length) setEntries(ents.map(migrateEntry).sort((a,b)=>b.createdAt-a.createdAt));
-        if(savedCats)   setCats(savedCats);
-        if(savedContacts.length) setContacts(savedContacts.map(migrateContact));
+        if(savedUser && savedUser !== user.id){
+          await Promise.all([idbClear(STORES.entries), idbClear(STORES.contacts), idbSetMeta("cats", DEFAULT_CATS)]);
+          setEntries([]); setCats(DEFAULT_CATS); setContacts([]);
+        } else {
+          if(ents.length) setEntries(ents.map(migrateEntry).sort((a,b)=>b.createdAt-a.createdAt));
+          if(savedCats)   setCats(savedCats);
+          if(savedContacts.length) setContacts(savedContacts.map(migrateContact));
+        }
+        await idbSetMeta("user_id", user.id);
       } catch(e){ console.error("IDB load error",e); }
       setDbReady(true);
     })();
-  },[]);
+  },[user.id]);
 
   // ── 변경 시 IndexedDB 저장 ───────────────────────────
   useEffect(()=>{ if(!dbReady) return; idbReplaceAll(STORES.entries,entries).catch(e=>console.error("IDB entries save",e)); },[entries,dbReady]);
@@ -1351,7 +1581,7 @@ function App() {
     return withSyncLock(async () => {
       setSyncStatus("syncing");
       try{
-        const remote = await withRetry(sbPull);
+        const remote = await withRetry(()=>sbPullRows(user.id));
         if(remote){
           const { entries: curE, contacts: curCon } = dataRef.current;
           const preferLocal=localDirtyRef.current;
@@ -1391,14 +1621,12 @@ function App() {
       setSyncStatus("syncing");
       try{
         const { entries: e, cats: c, contacts: con } = dataRef.current;
-        const remote=await withRetry(sbPull);
+        const remote=await withRetry(()=>sbPullRows(user.id));
         const mergedEntries=mergeRecords(e,remote?.entries||[],migrateEntry,true)
           .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
         const mergedContacts=mergeRecords(con,remote?.contacts||[],migrateContact,true);
         const mergedCats=c?.length?c:(remote?.cats||DEFAULT_CATS);
-        const bytes = approxPayloadBytes(mergedEntries,mergedCats,mergedContacts);
-        if(bytes > 4*1024*1024) console.warn("[sync] 페이로드가 큽니다(", (bytes/1048576).toFixed(1),"MB). 사진/첨부가 많으면 동기화가 느려지거나 실패할 수 있습니다.");
-        await withRetry(()=>sbPush(mergedEntries,mergedCats,mergedContacts));
+        await withRetry(()=>sbPushRows(user.id,mergedEntries,mergedCats,mergedContacts));
         dataRef.current={entries:mergedEntries,cats:mergedCats,contacts:mergedContacts};
         setEntries(mergedEntries);
         setContacts(mergedContacts);
@@ -1409,13 +1637,13 @@ function App() {
         setSyncStatus(navigator.onLine ? "error" : "offline");
       }
     });
-  },[]);
+  },[user.id]);
 
   // ── 앱 시작 시 Pull ──────────────────────────────────
   useEffect(()=>{
     if(!dbReady) return;
     pullAndMerge();
-  },[dbReady]);
+  },[dbReady,pullAndMerge]);
 
   // ── 탭/창 활성화 시 자동 Pull (기기 전환 대응) ────────
   useEffect(()=>{
@@ -1445,16 +1673,14 @@ function App() {
   useEffect(()=>{
     if(!dbReady) return;
     if(!sb) return;
-    const channel = sb.channel("wb_changes")
-      .on("postgres_changes",{ event:"*", schema:"public", table:"workbook_sync" }, (payload)=>{
-        const incoming = payload && payload.new && payload.new.synced_at;
-        // 방금 내가 올린 변경이 되돌아온 것이면 무시 (불필요한 재-pull·경쟁 방지)
-        if(incoming && Number(incoming) === _lastWriteToken) return;
-        pullAndMerge();
-      })
+    const onChange = ()=>{ if(Date.now() < _syncMuteUntil) return; pullAndMerge(); };
+    const channel = sb.channel("wb_changes_"+user.id)
+      .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.entries, filter:"user_id=eq."+user.id }, onChange)
+      .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.cats, filter:"user_id=eq."+user.id }, onChange)
+      .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.contacts, filter:"user_id=eq."+user.id }, onChange)
       .subscribe();
     return ()=>{ sb.removeChannel(channel); };
-  },[dbReady, pullAndMerge]);
+  },[dbReady, pullAndMerge, user.id]);
 
   // ── 데이터 변경 시 자동 Push (1.5초 디바운스, 로컬 변경 있을 때만) ──
   useEffect(()=>{
@@ -1491,7 +1717,7 @@ function App() {
     try{
       await withSyncLock(async ()=>{
         setSyncStatus("syncing");
-        const remote=await withRetry(sbPull);
+        const remote=await withRetry(()=>sbPullRows(user.id));
         const {entries:curE,cats:curC,contacts:curCon}=dataRef.current;
         const finalEntries=mergeRecords(curE,remote?.entries||[],migrateEntry,true)
           .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
@@ -1501,7 +1727,7 @@ function App() {
         setEntries(finalEntries);
         setCats(finalCats);
         setContacts(finalContacts);
-        await withRetry(()=>sbPush(finalEntries,finalCats,finalContacts));
+        await withRetry(()=>sbPushRows(user.id,finalEntries,finalCats,finalContacts));
         localDirtyRef.current=false;
         setSyncStatus("ok");
       });
@@ -1556,10 +1782,10 @@ function App() {
       await withSyncLock(async ()=>{
         setSyncStatus("syncing");
         const { entries: e, cats: c } = dataRef.current;
-        const remote=await withRetry(sbPull);
+        const remote=await withRetry(()=>sbPullRows(user.id));
         const mergedEntries=mergeRecords(e,remote?.entries||[],migrateEntry,true);
         const mergedContacts=mergeRecords(snapshot,remote?.contacts||[],migrateContact,true);
-        await withRetry(()=>sbPush(mergedEntries, c, mergedContacts));
+        await withRetry(()=>sbPushRows(user.id, mergedEntries, c, mergedContacts));
         dataRef.current={entries:mergedEntries,cats:c,contacts:mergedContacts};
         setEntries(mergedEntries);
         setContacts(mergedContacts);
@@ -1622,6 +1848,7 @@ function App() {
         </div>
         <div className="app-header-actions" style={{display:"flex",alignItems:"center",gap:8}}>
           <span className="header-count" style={{fontSize:11,color:"#aaa"}}>{totalActive}건</span>
+          <span className="header-count" style={{fontSize:10,color:"#aaa",maxWidth:120,overflow:"hidden",textOverflow:"ellipsis"}}>{user.email}</span>
           <button
             className="header-action"
             onClick={manualSync}
@@ -1637,6 +1864,7 @@ function App() {
             <span className="sync-label" style={{fontSize:10}}>{syncStatus==="syncing"?"동기화중":syncStatus==="ok"?"동기화됨":syncStatus==="error"?"오류":syncStatus==="offline"?"오프라인":"동기화"}</span>
           </button>
           <button className="header-action" onClick={()=>exportXLSX(liveEntries,cats,liveContacts)} style={{padding:"7px 10px",background:"#27ae60",color:"#fff",border:"none",borderRadius:7,fontSize:12,fontWeight:700,cursor:"pointer"}}>📊 엑셀</button>
+          <button className="header-action" onClick={()=>sb.auth.signOut()} style={{padding:"7px 10px",background:"rgba(255,255,255,0.12)",color:"#fff",border:"1px solid rgba(255,255,255,0.2)",borderRadius:7,fontSize:12,cursor:"pointer"}}>로그아웃</button>
           <button className="header-action" onClick={openNew} style={{padding:"7px 12px",background:"#e74c3c",color:"#fff",border:"none",borderRadius:7,fontSize:13,fontWeight:700,cursor:"pointer"}}>+ 추가</button>
         </div>
       </header>
@@ -1750,7 +1978,7 @@ function App() {
 
 
 const domRoot = ReactDOM.createRoot(document.getElementById('root'));
-domRoot.render(React.createElement(App));
+domRoot.render(React.createElement(AuthGate));
 </script>
 </body>
 </html>
