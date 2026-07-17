@@ -1540,6 +1540,9 @@ function App({user}) {
   const [unlocked,   setUnlocked]   = useState(()=>!!storageGet(SS, PW_SESSION)||!storageGet(LS, PW_KEY));
   const [showPwModal,setShowPwModal]= useState(false);
   const syncPushTimer  = useRef(null);
+  const realtimePullTimer = useRef(null);
+  const pullInFlightRef = useRef(false);
+  const pendingPullRef = useRef(false);
   const localDirtyRef  = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
@@ -1578,39 +1581,54 @@ function App({user}) {
   // ── Pull + 항목별 병합 함수 (잠금·재시도·오프라인 처리 포함) ──
   const pullAndMerge = useCallback(async () => {
     if(!navigator.onLine){ setSyncStatus("offline"); return false; }
-    return withSyncLock(async () => {
-      setSyncStatus("syncing");
-      try{
-        const remote = await withRetry(()=>sbPullRows(user.id));
-        if(remote){
-          const { entries: curE, contacts: curCon } = dataRef.current;
-          const preferLocal=localDirtyRef.current;
-          const mergedEntries=mergeRecords(curE,remote.entries||[],migrateEntry,preferLocal)
-            .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
-          const mergedContacts=mergeRecords(curCon,remote.contacts||[],migrateContact,preferLocal);
-          const needsPush=preferLocal
-            ||!sameRecords(mergedEntries,remote.entries||[],migrateEntry)
-            ||!sameRecords(mergedContacts,remote.contacts||[],migrateContact);
+    if(pullInFlightRef.current){
+      pendingPullRef.current = true;
+      return false;
+    }
+    pullInFlightRef.current = true;
+    try{
+      let didSync = false;
+      do {
+        pendingPullRef.current = false;
+        const ok = await withSyncLock(async () => {
+          setSyncStatus("syncing");
+          try{
+            const remote = await withRetry(()=>sbPullRows(user.id));
+            if(remote){
+              const { entries: curE, contacts: curCon } = dataRef.current;
+              const preferLocal=localDirtyRef.current;
+              const mergedEntries=mergeRecords(curE,remote.entries||[],migrateEntry,preferLocal)
+                .sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+              const mergedContacts=mergeRecords(curCon,remote.contacts||[],migrateContact,preferLocal);
+              const needsPush=preferLocal
+                ||!sameRecords(mergedEntries,remote.entries||[],migrateEntry)
+                ||!sameRecords(mergedContacts,remote.contacts||[],migrateContact);
 
-          dataRef.current={
-            entries:mergedEntries,
-            cats:remote.cats?.length?remote.cats:dataRef.current.cats,
-            contacts:mergedContacts,
-          };
-          setEntries(mergedEntries);
-          setContacts(mergedContacts);
-          if(remote.cats?.length) setCats(remote.cats);
-          localDirtyRef.current=needsPush;
-        }
-        setSyncStatus("ok");
-        return true;
-      }catch(e){
-        console.error("Supabase pull",e);
-        setSyncStatus(navigator.onLine ? "error" : "offline");
-        return false;
-      }
-    });
-  },[]);
+              dataRef.current={
+                entries:mergedEntries,
+                cats:remote.cats?.length?remote.cats:dataRef.current.cats,
+                contacts:mergedContacts,
+              };
+              setEntries(mergedEntries);
+              setContacts(mergedContacts);
+              if(remote.cats?.length) setCats(remote.cats);
+              localDirtyRef.current=needsPush;
+            }
+            setSyncStatus("ok");
+            return true;
+          }catch(e){
+            console.error("Supabase pull",e);
+            setSyncStatus(navigator.onLine ? "error" : "offline");
+            return false;
+          }
+        });
+        didSync = didSync || ok;
+      } while(pendingPullRef.current);
+      return didSync;
+    } finally {
+      pullInFlightRef.current = false;
+    }
+  },[user.id]);
 
   // ── Push 실행 (잠금·재시도, 로컬 변경 있을 때만) ──────
   const flushPush = useCallback(async () => {
@@ -1673,13 +1691,20 @@ function App({user}) {
   useEffect(()=>{
     if(!dbReady) return;
     if(!sb) return;
-    const onChange = ()=>{ if(Date.now() < _syncMuteUntil) return; pullAndMerge(); };
+    const onChange = ()=>{
+      if(Date.now() < _syncMuteUntil) return;
+      clearTimeout(realtimePullTimer.current);
+      realtimePullTimer.current = setTimeout(()=>{ pullAndMerge(); }, 800);
+    };
     const channel = sb.channel("wb_changes_"+user.id)
       .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.entries, filter:"user_id=eq."+user.id }, onChange)
       .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.cats, filter:"user_id=eq."+user.id }, onChange)
       .on("postgres_changes",{ event:"*", schema:"public", table:ROW_TABLES.contacts, filter:"user_id=eq."+user.id }, onChange)
       .subscribe();
-    return ()=>{ sb.removeChannel(channel); };
+    return ()=>{
+      clearTimeout(realtimePullTimer.current);
+      sb.removeChannel(channel);
+    };
   },[dbReady, pullAndMerge, user.id]);
 
   // ── 데이터 변경 시 자동 Push (1.5초 디바운스, 로컬 변경 있을 때만) ──
