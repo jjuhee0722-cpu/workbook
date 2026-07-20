@@ -3849,6 +3849,7 @@ function App({
   const [modal, setModal] = useState(null);
   const [showSidebar, setShowSidebar] = useState(false);
   const [showCatMgr, setShowCatMgr] = useState(false);
+  const [showDiag, setShowDiag] = useState(false);
   const [selected, setSelected] = useState(new Set()); // 선택된 항목 id
   const [dbReady, setDbReady] = useState(false);
   const [syncStatus, setSyncStatus] = useState("idle"); // idle|syncing|ok|error
@@ -3858,6 +3859,10 @@ function App({
   const realtimePullTimer = useRef(null);
   const pullInFlightRef = useRef(false);
   const pendingPullRef = useRef(false);
+  const lastPullAtRef = useRef(null);
+  const lastPushAtRef = useRef(null);
+  const lastRealtimeAtRef = useRef(null);
+  const lastErrorRef = useRef("");
   const localDirtyRef = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
@@ -3931,6 +3936,7 @@ function App({
           try {
             const remote = await withRetry(() => sbPullRows(user.id));
             if (remote) {
+              lastPullAtRef.current = Date.now();
               const {
                 entries: curE,
                 contacts: curCon
@@ -3949,10 +3955,12 @@ function App({
               if (remote.cats?.length) setCats(remote.cats);
               localDirtyRef.current = needsPush;
             }
+            lastErrorRef.current = "";
             setSyncStatus("ok");
             return true;
           } catch (e) {
             console.error("Supabase pull", e);
+            lastErrorRef.current = e && e.message ? e.message : String(e);
             setSyncStatus(navigator.onLine ? "error" : "offline");
             return false;
           }
@@ -3986,6 +3994,8 @@ function App({
         const mergedContacts = mergeRecords(con, remote?.contacts || [], migrateContact, true);
         const mergedCats = c?.length ? c : remote?.cats || DEFAULT_CATS;
         await withRetry(() => sbPushRows(user.id, mergedEntries, mergedCats, mergedContacts));
+        lastPushAtRef.current = Date.now();
+        lastErrorRef.current = "";
         dataRef.current = {
           entries: mergedEntries,
           cats: mergedCats,
@@ -3997,6 +4007,7 @@ function App({
         setSyncStatus("ok");
       } catch (err) {
         console.error("Supabase push", err);
+        lastErrorRef.current = err && err.message ? err.message : String(err);
         setSyncStatus(navigator.onLine ? "error" : "offline");
       }
     });
@@ -4042,6 +4053,7 @@ function App({
     if (!sb) return;
     const onChange = () => {
       if (Date.now() < _syncMuteUntil) return;
+      lastRealtimeAtRef.current = Date.now();
       clearTimeout(realtimePullTimer.current);
       realtimePullTimer.current = setTimeout(() => {
         pullAndMerge();
@@ -4196,12 +4208,15 @@ function App({
         setCats(finalCats);
         setContacts(finalContacts);
         await withRetry(() => sbPushRows(user.id, finalEntries, finalCats, finalContacts));
+        lastPushAtRef.current = Date.now();
+        lastErrorRef.current = "";
         localDirtyRef.current = false;
         setSyncStatus("ok");
       });
       alert("동기화 완료!");
     } catch (e) {
       console.error("manual sync", e);
+      lastErrorRef.current = e && e.message ? e.message : String(e);
       setSyncStatus(navigator.onLine ? "error" : "offline");
       alert("동기화 오류: " + (e && e.message ? e.message : e));
     }
@@ -4285,6 +4300,8 @@ function App({
         const mergedEntries = mergeRecords(e, remote?.entries || [], migrateEntry, true);
         const mergedContacts = mergeRecords(snapshot, remote?.contacts || [], migrateContact, true);
         await withRetry(() => sbPushRows(user.id, mergedEntries, c, mergedContacts));
+        lastPushAtRef.current = Date.now();
+        lastErrorRef.current = "";
         dataRef.current = {
           entries: mergedEntries,
           cats: c,
@@ -4297,6 +4314,7 @@ function App({
       });
     } catch (err) {
       console.error("forceSave", err);
+      lastErrorRef.current = err && err.message ? err.message : String(err);
       setSyncStatus(navigator.onLine ? "error" : "offline");
       throw err; // SaveBtn이 ⚠ 오류 표시할 수 있도록 re-throw
     }
@@ -4351,6 +4369,7 @@ function App({
   });
   const selActive = selected.size > 0;
   const selBarRef = useRef(null);
+  const diagRows = [["계정", user.email || user.id], ["상태", syncStatus], ["온라인", navigator.onLine ? "예" : "아니오"], ["로컬 변경 대기", localDirtyRef.current ? "있음" : "없음"], ["Pull 실행 중", pullInFlightRef.current ? "예" : "아니오"], ["예약된 Pull", pendingPullRef.current ? "있음" : "없음"], ["마지막 Pull", lastPullAtRef.current ? fmtTs(lastPullAtRef.current) : "기록 없음"], ["마지막 Push", lastPushAtRef.current ? fmtTs(lastPushAtRef.current) : "기록 없음"], ["마지막 Realtime", lastRealtimeAtRef.current ? fmtTs(lastRealtimeAtRef.current) : "기록 없음"], ["항목/분류/담당자", `${entries.length} / ${cats.length} / ${contacts.length}`], ["마지막 오류", lastErrorRef.current || "없음"]];
   if (!unlocked) return /*#__PURE__*/React.createElement(LockScreen, {
     onUnlock: () => setUnlocked(true)
   });
@@ -4624,7 +4643,23 @@ function App({
       color: "#555",
       fontWeight: 600
     }
-  }, storageGet(LS, PW_KEY) ? '🔑 비밀번호 변경' : '🔒 비밀번호 설정'), /*#__PURE__*/React.createElement("label", {
+  }, storageGet(LS, PW_KEY) ? '🔑 비밀번호 변경' : '🔒 비밀번호 설정'), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setShowDiag(true);
+      setShowSidebar(false);
+    },
+    style: {
+      width: "100%",
+      padding: "10px",
+      border: "1px dashed #b8d8ff",
+      borderRadius: 8,
+      background: "#f7fbff",
+      fontSize: 13,
+      cursor: "pointer",
+      color: "#2980b9",
+      fontWeight: 700
+    }
+  }, "\uD83E\uDE7A \uB3D9\uAE30\uD654 \uC9C4\uB2E8"), /*#__PURE__*/React.createElement("label", {
     style: {
       display: "flex",
       alignItems: "center",
@@ -4817,7 +4852,112 @@ function App({
     onClose: () => setShowCatMgr(false)
   }), showPwModal && /*#__PURE__*/React.createElement(PasswordModal, {
     onClose: () => setShowPwModal(false)
-  }), /*#__PURE__*/React.createElement("nav", {
+  }), showDiag && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed",
+      inset: 0,
+      background: "rgba(0,0,0,0.55)",
+      zIndex: 500,
+      display: "flex",
+      alignItems: "flex-end",
+      justifyContent: "center"
+    },
+    onClick: () => setShowDiag(false)
+  }, /*#__PURE__*/React.createElement("div", {
+    onClick: e => e.stopPropagation(),
+    style: {
+      background: "#fff",
+      borderRadius: "16px 16px 0 0",
+      padding: "20px 18px 34px",
+      width: "100%",
+      maxWidth: 560,
+      maxHeight: "88vh",
+      overflowY: "auto",
+      boxSizing: "border-box"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 40,
+      height: 4,
+      background: "#ddd",
+      borderRadius: 2,
+      margin: "0 auto 16px"
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 10,
+      marginBottom: 12
+    }
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontWeight: 800,
+      fontSize: 17,
+      color: "#1a1a2e"
+    }
+  }, "\uD83E\uDE7A \uB3D9\uAE30\uD654 \uC9C4\uB2E8"), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#888",
+      marginTop: 4,
+      lineHeight: 1.5
+    }
+  }, "\uBA39\uD1B5\uCC98\uB7FC \uBCF4\uC77C \uB54C \uC6D0\uC778\uC744 \uBE60\uB974\uAC8C \uD655\uC778\uD558\uB294 \uC0C1\uD0DC\uD45C\uC785\uB2C8\uB2E4.")), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowDiag(false),
+    style: {
+      border: "none",
+      background: "#f2f2f2",
+      borderRadius: 8,
+      padding: "8px 10px",
+      cursor: "pointer",
+      fontSize: 12,
+      color: "#555"
+    }
+  }, "\uB2EB\uAE30")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      border: "1px solid #eee",
+      borderRadius: 12,
+      overflow: "hidden"
+    }
+  }, diagRows.map(([label, value], i) => /*#__PURE__*/React.createElement("div", {
+    key: label,
+    style: {
+      display: "grid",
+      gridTemplateColumns: "120px 1fr",
+      gap: 8,
+      padding: "10px 12px",
+      background: i % 2 ? "#fff" : "#fafafa",
+      borderTop: i ? "1px solid #eee" : "none",
+      fontSize: 12,
+      lineHeight: 1.5
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: "#777",
+      fontWeight: 700
+    }
+  }, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      color: label === "마지막 오류" && value !== "없음" ? "#c0392b" : "#333",
+      wordBreak: "break-word"
+    }
+  }, value)))), /*#__PURE__*/React.createElement("button", {
+    onClick: manualSync,
+    style: {
+      width: "100%",
+      marginTop: 14,
+      padding: "12px",
+      border: "none",
+      borderRadius: 10,
+      background: "#1a1a2e",
+      color: "#fff",
+      fontSize: 14,
+      fontWeight: 800,
+      cursor: "pointer"
+    }
+  }, "\uC9C0\uAE08 \uB3D9\uAE30\uD654 \uC7AC\uC2DC\uB3C4"))), /*#__PURE__*/React.createElement("nav", {
     style: {
       position: "fixed",
       bottom: 0,
