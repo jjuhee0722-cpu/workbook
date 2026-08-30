@@ -1143,12 +1143,115 @@ function ContactForm({initial,onSubmit,onCancel}) {
 // ══════════════════════════════════════════════════════════
 //  날짜별 / 태그별 / 텍스트 입력 탭
 // ══════════════════════════════════════════════════════════
-function DateView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
-  const groups={};
-  entries.filter(e=>!e.done).forEach(e=>{const d=e.date||"날짜 없음";if(!groups[d])groups[d]=[];groups[d].push(e);});
-  const sorted=Object.entries(groups).sort((a,b)=>b[0].localeCompare(a[0]));
-  if(!sorted.length) return <Empty text="미완료 항목이 없습니다."/>;
-  return <div>{sorted.map(([date,items])=>(<div key={date} style={{marginBottom:22}}><div style={{fontSize:12,fontWeight:700,color:"#1a1a2e",background:"#e8e8f0",padding:"5px 12px",borderRadius:6,marginBottom:8,display:"inline-block"}}>{"📅 "+date+" ("+items.length+"건)"}</div><div style={{display:"flex",flexDirection:"column",gap:8}}>{items.map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={onSelect} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle}/>)}</div></div>))}</div>;
+function DateView({entries,cats,onEdit}) {
+  const live=entries.filter(e=>!e.done&&e.date);
+  const years=[...new Set(live.map(e=>Number((e.date||"").slice(0,4))).filter(Boolean))].sort((a,b)=>b-a);
+  const thisYear=new Date().getFullYear();
+  const initialYear=years.includes(thisYear)?thisYear:(years[0]||thisYear);
+  const [year,setYear]=useState(initialYear);
+  const [selectedDate,setSelectedDate]=useState(todayStr());
+  const catById=new Map(cats.map(c=>[c.id,c]));
+  const byDate={};
+  live.forEach(e=>{ if(!byDate[e.date]) byDate[e.date]=[]; byDate[e.date].push(e); });
+  const selectedItems=(byDate[selectedDate]||[]).sort((a,b)=>(b.updatedAt||0)-(a.updatedAt||0));
+  const monthNames=["1월","2월","3월","4월","5월","6월","7월","8월","9월","10월","11월","12월"];
+  const weekLabels=["일","월","화","수","목","금","토"];
+  const today=todayStr();
+
+  useEffect(()=>{
+    if(String(selectedDate).startsWith(String(year)+"-")) return;
+    const firstInYear=Object.keys(byDate).filter(date=>date.startsWith(String(year)+"-")).sort()[0];
+    setSelectedDate(firstInYear || `${year}-01-01`);
+  },[year]);
+
+  function monthDays(monthIndex){
+    const first=new Date(year,monthIndex,1);
+    const total=new Date(year,monthIndex+1,0).getDate();
+    const cells=[];
+    for(let i=0;i<first.getDay();i++) cells.push(null);
+    for(let d=1;d<=total;d++) cells.push(`${year}-${pad(monthIndex+1)}-${pad(d)}`);
+    while(cells.length%7) cells.push(null);
+    return cells;
+  }
+  function dotsFor(date){
+    const colors=[];
+    (byDate[date]||[]).forEach(e=>{
+      const color=catById.get(e.category)?.color||"#7f8c8d";
+      if(!colors.includes(color)) colors.push(color);
+    });
+    return colors.slice(0,4);
+  }
+
+  if(!live.length) return <Empty text="날짜가 있는 미완료 항목이 없습니다."/>;
+  return (
+    <div>
+      <div style={{position:"sticky",top:104,zIndex:120,background:"#f2f2ef",padding:"2px 0 12px",marginBottom:6}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,background:"#fff",border:"1px solid #e5e5df",borderRadius:14,padding:"12px 14px",boxShadow:"0 2px 8px rgba(0,0,0,0.04)"}}>
+          <button onClick={()=>setYear(y=>y-1)} style={{border:"none",background:"#f5f5f5",borderRadius:10,width:38,height:34,fontSize:18,cursor:"pointer",color:"#555"}}>‹</button>
+          <div style={{textAlign:"center"}}>
+            <div style={{fontSize:22,fontWeight:900,color:"#1a1a2e",letterSpacing:-0.5}}>{year}</div>
+            <div style={{fontSize:11,color:"#999",marginTop:2}}>작성 날짜 기준 · 미완료 항목</div>
+          </div>
+          <button onClick={()=>setYear(y=>y+1)} style={{border:"none",background:"#f5f5f5",borderRadius:10,width:38,height:34,fontSize:18,cursor:"pointer",color:"#555"}}>›</button>
+        </div>
+      </div>
+
+      <div style={{display:"grid",gridTemplateColumns:"1fr",gap:14}}>
+        {monthNames.map((name,monthIndex)=>(
+          <div key={name} style={{background:"#fff",border:"1px solid #e5e5df",borderRadius:16,padding:"14px 12px",boxShadow:"0 2px 10px rgba(0,0,0,0.035)"}}>
+            <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+              <div style={{fontSize:16,fontWeight:900,color:"#1a1a2e"}}>{name}</div>
+              <div style={{fontSize:11,color:"#aaa"}}>{live.filter(e=>e.date?.startsWith(`${year}-${pad(monthIndex+1)}`)).length}건</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4,marginBottom:5}}>
+              {weekLabels.map(w=><div key={w} style={{fontSize:10,fontWeight:800,color:w==="일"?"#e74c3c":w==="토"?"#2980b9":"#aaa",textAlign:"center",padding:"3px 0"}}>{w}</div>)}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:4}}>
+              {monthDays(monthIndex).map((date,i)=>{
+                const day=date?Number(date.slice(8,10)):null;
+                const items=byDate[date]||[];
+                const hasItems=items.length>0;
+                const active=date===selectedDate;
+                const isToday=date===today;
+                return (
+                  <button key={date||"blank"+i} disabled={!date} onClick={()=>date&&setSelectedDate(date)}
+                    style={{minHeight:46,border:active?"2px solid #1a1a2e":isToday?"1.5px solid #e74c3c":"1px solid transparent",borderRadius:10,background:active?"#f0f0ff":hasItems?"#fbfbfb":"transparent",cursor:date?"pointer":"default",padding:"5px 2px",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"flex-start",gap:4}}>
+                    {date&&<span style={{fontSize:12,fontWeight:active||isToday?900:600,color:active?"#1a1a2e":day===null?"transparent":"#555"}}>{day}</span>}
+                    {hasItems&&(
+                      <div style={{display:"flex",gap:2,flexWrap:"wrap",justifyContent:"center",maxWidth:28}}>
+                        {dotsFor(date).map((color,idx)=><span key={color+idx} style={{width:5,height:5,borderRadius:"50%",background:color,display:"inline-block"}}/>)}
+                      </div>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{position:"sticky",bottom:66,zIndex:110,marginTop:16,background:"#fff",border:"1px solid #e5e5df",borderRadius:16,padding:"14px",boxShadow:"0 -2px 14px rgba(0,0,0,0.08)"}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:10}}>
+          <div style={{fontSize:14,fontWeight:900,color:"#1a1a2e"}}>📌 {selectedDate}</div>
+          <div style={{fontSize:11,color:"#999"}}>{selectedItems.length}건</div>
+        </div>
+        {selectedItems.length?(
+          <div style={{display:"flex",flexDirection:"column",gap:7}}>
+            {selectedItems.map(e=>{
+              const cat=catById.get(e.category)||{label:e.category,color:"#7f8c8d",icon:"•"};
+              return (
+                <button key={e.id} onClick={()=>onEdit(e)} style={{display:"flex",alignItems:"center",gap:8,textAlign:"left",border:"1px solid #eee",borderRadius:10,background:"#fafafa",padding:"9px 10px",cursor:"pointer"}}>
+                  <span style={{width:9,height:9,borderRadius:"50%",background:cat.color,flexShrink:0}}/>
+                  <span style={{fontSize:11,color:cat.color,fontWeight:800,whiteSpace:"nowrap"}}>{cat.label}</span>
+                  <span style={{fontSize:13,color:"#1a1a2e",fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title||"(제목 없음)"}</span>
+                </button>
+              );
+            })}
+          </div>
+        ):<div style={{fontSize:12,color:"#aaa",padding:"4px 0"}}>이 날짜에 작성된 미완료 항목이 없습니다.</div>}
+      </div>
+    </div>
+  );
 }
 
 function TagView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
