@@ -33,3 +33,9 @@ jobs:
 
       - name: Test sync merge rules
         run: npm run test:sync
+
+      - name: Test status filters and password recovery
+        run: npm run test:ui && npm run test:auth
+
+      - name: Test cloud request timeout and payload stability
+        run: npm run test:cloud

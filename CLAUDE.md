@@ -1,12 +1,14 @@
 # 업무수첩 프로젝트
 
-React + Supabase 기반 업무 관리 앱. JSX 원본을 빌드해 단일 `index.html`로 GitHub Pages에 배포한다.
+React + Supabase 기반 업무 관리 앱. 역할별 JS/JSX 원본을 빌드해 단일 `index.html`로 GitHub Pages에 배포한다. 작업 지침은 `AGENTS.md`를 우선 확인한다.
 
 ## 배포 정보
 
 - GitHub 저장소: `jjuhee0722-cpu/workbook`
 - Pages URL: `https://jjuhee0722-cpu.github.io/workbook/`
-- 작업 파일: `src/index.html`
+- 개발 템플릿: `src/index.html`
+- 화면: `src/ui/*.jsx`, 앱 상태/연결: `src/app.jsx`
+- 저장/동기화: `src/data/local.js`, `src/data/sync.js`
 - 배포 파일: `index.html` (`npm run build`로 생성)
 
 ## 기술 스택
@@ -30,7 +32,7 @@ React + Supabase 기반 업무 관리 앱. JSX 원본을 빌드해 단일 `index
   - `workbook_sync` / `id=main`
   - 첫 로그인 때 신규 테이블로 1회 이관하는 legacy source
 - Storage bucket: `workbook` (private)
-- anon key: `src/index.html`의 `SB_KEY` 변수에 있음. 공개 키라 노출 자체는 정상이며, 실제 접근 제어는 RLS/Auth가 담당한다.
+- anon key: `src/data/sync.js`의 `SB_KEY` 변수에 있음. 공개 키라 노출 자체는 정상이며, 실제 접근 제어는 RLS/Auth가 담당한다.
 
 ## 마이그레이션 순서
 
@@ -74,9 +76,18 @@ React + Supabase 기반 업무 관리 앱. JSX 원본을 빌드해 단일 `index
 
 ## 파일 구조
 
-- `src/index.html`: 편집 가능한 React JSX 원본
+- `src/index.html`: CSS/라이브러리/개발 소스 순서를 지정하는 템플릿
+- `src/app.jsx`: 앱 상태, CRUD, 화면 연결
+- `src/data/local.js`: IndexedDB
+- `src/data/sync.js`: Auth 클라이언트, 동기화/파일 저장, 데이터 병합/내보내기 도우미
+- `src/ui/tasks.jsx`: 공통 표시, 접이식 업무 카드, 선택 액션, 서식 편집기
+- `src/ui/contacts.jsx`: 담당자 화면
+- `src/ui/calendar.jsx`: 월별 달력, 태그별 화면
+- `src/ui/media.jsx`: 사진/첨부 표시
+- `src/ui/auth.jsx`: 로그인/복구/기기 화면 잠금
 - `index.html`: GitHub Pages 배포 산출물, 직접 편집 금지
 - `scripts/build.mjs`: JSX 사전 컴파일
+- `scripts/source.mjs`: 템플릿의 소스 순서대로 JS/JSX 읽기
 - `scripts/validate_index.py`: 배포 구조 검증
 - `scripts/test_sync_model.mjs`: 병합 모델 검증
 - `supabase/migrations/*.sql`: Supabase 적용 SQL

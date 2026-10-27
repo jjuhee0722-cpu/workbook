@@ -1,9 +1,9 @@
-import {readFile} from 'node:fs/promises';
+import {loadAppSource} from './source.mjs';
 import {runInNewContext} from 'node:vm';
 import assert from 'node:assert/strict';
 import {transform} from '@babel/standalone';
 
-const source=await readFile(new URL('../src/index.html',import.meta.url),'utf8');
+const {source}=await loadAppSource();
 const auth=source.slice(source.indexOf('function AuthGate()'),source.indexOf('function App({user})'));
 const compiled=transform(auth,{presets:['react']}).code;
 let states=[],cursor=0,effectStarted=false,listener,updates=0,request;

@@ -5,7 +5,10 @@
   "scripts": {
     "build": "node scripts/build.mjs",
     "validate": "python3 scripts/validate_index.py",
-    "test:sync": "node scripts/test_sync_model.mjs"
+    "test:sync": "node scripts/test_sync_model.mjs && node scripts/test_sync_inflight.mjs",
+    "test:ui": "node scripts/test_task_status.mjs && node scripts/test_layout.mjs",
+    "test:auth": "node scripts/test_auth_recovery.mjs",
+    "test:cloud": "node scripts/test_cloud_requests.mjs"
   },
   "devDependencies": {
     "@babel/standalone": "7.28.5"

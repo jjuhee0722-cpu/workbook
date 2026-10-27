@@ -1,7 +1,7 @@
-import { readFile } from "node:fs/promises";
+import {loadAppSource} from './source.mjs';
 import vm from "node:vm";
 
-const source = await readFile(new URL("../src/index.html", import.meta.url), "utf8");
+const {source}=await loadAppSource();
 const start = source.indexOf("const migrateEntry");
 const end = source.indexOf("function getDday", start);
 

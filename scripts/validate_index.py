@@ -2,6 +2,7 @@
 """Validate the workbook GitHub Pages entrypoint before deployment."""
 
 from pathlib import Path
+import re
 import sys
 
 
@@ -51,6 +52,10 @@ def main() -> None:
 
     if 'type="text/babel"' not in source:
         fail("src/index.html must remain the editable JSX source")
+
+    modules = re.findall(r'type="text/babel" data-presets="react" src="\./([^\"]+)"', source)
+    if not modules or any(not (SOURCE.parent / module).is_file() for module in modules):
+        fail("One or more development source modules are missing")
 
     if "scripts/build.mjs" not in PACKAGE.read_text(encoding="utf-8"):
         fail("package.json does not point to the build script")

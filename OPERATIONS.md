@@ -2,7 +2,8 @@
 
 이 저장소는 GitHub Pages에서 `index.html`로 실행되는 업무수첩입니다.
 
-- 편집 원본: `src/index.html`
+- 편집 원본: `src/ui/*.jsx`, `src/app.jsx`, `src/data/*.js`
+- CSS/개발 진입 템플릿: `src/index.html`
 - 배포 산출물: `index.html`
 - 빌드 도구: `scripts/build.mjs`
 
@@ -11,7 +12,8 @@
 - 운영 페이지에는 `type="text/babel"`을 넣지 않습니다.
 - 운영 페이지에는 `@babel/standalone` 또는 `babel.min.js`를 넣지 않습니다.
 - JSX는 배포 전에 일반 JavaScript로 미리 컴파일된 상태여야 합니다.
-- `index.html`을 직접 편집하지 않습니다. 모든 기능 수정은 `src/index.html`에서 합니다.
+- `index.html`을 직접 편집하지 않습니다. 기능은 역할별 원본 파일에서, CSS와 소스 목록은 `src/index.html`에서 수정합니다.
+- 임시 폴더의 `file:///private/tmp/...` 주소를 운영 링크로 안내하지 않습니다. 운영 주소는 `https://jjuhee0722-cpu.github.io/workbook/`입니다.
 - 배포 후에는 `https://jjuhee0722-cpu.github.io/workbook/?v=<commit>`처럼 커밋 값을 붙여 캐시를 피해 확인합니다.
 
 ## 수정 및 빌드
@@ -21,9 +23,12 @@ npm install
 npm run build
 python3 scripts/validate_index.py
 npm run test:sync
+npm run test:ui
+npm run test:auth
+npm run test:cloud
 ```
 
-`npm run build`가 `src/index.html`을 컴파일해 배포용 `index.html`을 만듭니다.
+`npm run build`가 `src/index.html`에 나열한 모듈을 순서대로 합쳐 컴파일한 뒤 배포용 `index.html`을 만듭니다. 별도 서버나 DB 마이그레이션 없이 기존 GitHub Pages에 배포합니다.
 
 ## 업로드 전 검증
 
@@ -77,11 +82,11 @@ RLS 정책은 `auth.uid() = user_id` 기준입니다. 앱에서 Supabase schema�
 
 일반 코드 수정:
 
-1. `src/index.html` 수정
+1. 역할에 맞는 `src` 원본 파일 수정
 2. `npm run build`
 3. `python3 scripts/validate_index.py`
-4. `npm run test:sync`
-5. `git add src/index.html index.html ...`
+4. `npm run test:sync`, `npm run test:ui`, `npm run test:auth`, `npm run test:cloud`
+5. 의도한 원본 파일, `index.html`, 변경 문서를 명시적으로 stage
 6. `git commit`
 7. `git push origin main`
 
@@ -103,6 +108,17 @@ Supabase SQL이 포함된 수정:
 - 사진만 실패하면 Storage bucket `workbook` 정책과 signed URL 생성 권한을 확인합니다.
 - 여러 기기에서 꼬이면 realtime 이벤트보다 최종 row 상태가 기준입니다. 항목별 `updatedAt`/`deletedAt`이 병합 기준입니다.
 - 완전 롤백이 필요하면 GitHub Pages는 이전 커밋으로 되돌릴 수 있지만, Supabase schema 변경은 별도 SQL로 되돌려야 합니다.
+
+## 2026-10-27 구조 개편 후 확인 항목
+
+- 업무 카드는 기본 접힘이며 제목을 누르면 메모·사진·첨부·수정/삭제 버튼을 표시합니다.
+- 체크박스 선택과 완료 처리는 별도 동작입니다. 완료 처리 후 완료 필터에서도 확인합니다.
+- 월별 달력은 이전/다음 달, 연월 직접 이동, 오늘 버튼을 제공합니다. 날짜별 탭 재진입 시 오늘로 초기화합니다.
+- 엑셀·로그아웃·분류 관리·잠금·진단은 메뉴에, 업무 추가는 상단 버튼 한 곳에 둡니다.
+- 일반 클라우드 요청은 20초, Storage 파일 요청은 60초 후 실제 네트워크 요청을 중단합니다. 실패 시 진단/재시도를 제공합니다.
+- 저장 진행 중 다른 업무를 편집하면 이전 응답이 최신 화면을 덮지 않으며, 후속 변경은 저장 대기 상태를 유지합니다.
+- `bodyHtml`과 일반 텍스트 `body`는 함께 유지합니다. Storage signed URL은 표시용이며 영구 저장/변경 비교에서 제외합니다.
+- DB 테이블, 사용자 ID, 로컬 DB 이름은 이 개편에서 변경하지 않았습니다.
 
 ## 보안
 

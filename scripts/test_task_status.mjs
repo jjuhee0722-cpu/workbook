@@ -1,8 +1,8 @@
-import {readFile} from 'node:fs/promises';
+import {loadAppSource} from './source.mjs';
 import {runInNewContext} from 'node:vm';
 import assert from 'node:assert/strict';
 import {transform} from '@babel/standalone';
-const html=await readFile(new URL('../src/index.html',import.meta.url),'utf8');
+const {source:html}=await loadAppSource();
 let app=html.slice(html.indexOf('function App({user})'),html.indexOf('const domRoot'));
 // Seed the local cache and skip asynchronous DB loading; exercise actual UI handlers.
 app=app.replace('useState([])','useState(seedEntries)').replace(/(const \[dbReady,\s*setDbReady\]\s*=\s*useState\()false/,'$1true');

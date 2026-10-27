@@ -2,7 +2,7 @@
 <html lang="ko">
 <head>
   <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <meta name="apple-mobile-web-app-capable" content="yes"/>
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
   <meta name="apple-mobile-web-app-title" content="업무수첩"/>
@@ -148,14 +148,55 @@ async function idbSetMeta(key, value) {
 // ══════════════════════════════════════════════════════════
 //  Supabase 동기화 레이어
 // ══════════════════════════════════════════════════════════
+
 const SB_URL = "https://qroxbykatxpqvvgaftom.supabase.co";
 // Capture recovery intent before the auth client consumes the URL fragment.
 const RECOVERY_FROM_URL = new URLSearchParams(location.hash.slice(1)).get("type") === "recovery";
 const SB_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InFyb3hieWthdHhwcXZ2Z2FmdG9tIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzkzODI1NjUsImV4cCI6MjA5NDk1ODU2NX0.wGtQyS234I4TJRBycakvPdfXRySQite7w2OQ9TytoGE";
+async function fetchWithDeadline(input, options = {}, timeoutMs = String(input).includes("/storage/v1/object/") ? 60000 : 20000) {
+  const controller = new AbortController();
+  let timedOut = false;
+  const cancel = () => controller.abort();
+  if (options.signal?.aborted) cancel();
+  options.signal?.addEventListener("abort", cancel, {
+    once: true
+  });
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    const response = await fetch(input, {
+      ...options,
+      signal: controller.signal
+    });
+    // Keep the deadline active while the response body is still arriving.
+    const body = response.body === null ? null : await response.arrayBuffer();
+    return new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers
+    });
+  } catch (error) {
+    if (timedOut) {
+      const e = new Error("서버 응답 시간이 초과되었습니다. 연결 상태를 확인하고 다시 시도해 주세요.");
+      e.code = "SYNC_TIMEOUT";
+      throw e;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    options.signal?.removeEventListener("abort", cancel);
+  }
+}
 const sb = (() => {
   try {
     if (!window.supabase || !window.supabase.createClient) return null;
-    return window.supabase.createClient(SB_URL, SB_KEY);
+    return window.supabase.createClient(SB_URL, SB_KEY, {
+      global: {
+        fetch: fetchWithDeadline
+      }
+    });
   } catch (e) {
     console.warn("[sync] Supabase 초기화 실패. 로컬 모드로 실행합니다.", e && e.message);
     return null;
@@ -235,7 +276,7 @@ async function withRetry(fn, {
     } catch (e) {
       lastErr = e;
       const code = e && (e.code || e.status);
-      if (code === 401 || code === 403 || code === 'PGRST301') break; // 권한 문제는 즉시 중단
+      if (code === 401 || code === 403 || code === 'PGRST301' || code === 'SYNC_TIMEOUT' || /서버 응답 시간이 초과/.test(e?.message || "")) break;
       if (i < tries - 1) await new Promise(r => setTimeout(r, base * Math.pow(2, i)));
     }
   }
@@ -272,6 +313,7 @@ function cleanPayload(value) {
   if (value && typeof value === "object") {
     const out = {};
     Object.keys(value).forEach(k => {
+      if (value.path && (k === "url" || k === "data")) return; // signed URLs are transient display data
       const v = value[k];
       if (v !== undefined) out[k] = cleanPayload(v);
     });
@@ -352,7 +394,7 @@ const PRIS = [{
 // 하단 네비 탭
 const NAV_TABS = [{
   id: "list",
-  label: "목록",
+  label: "업무",
   icon: "📋"
 }, {
   id: "date",
@@ -575,7 +617,7 @@ function mergeRecords(local, remote, migrate, preferLocalOrder = true) {
 }
 function sameRecords(a, b, migrate) {
   const normalize = list => (list || []).map(migrate).sort((x, y) => String(x.id).localeCompare(String(y.id)));
-  return JSON.stringify(normalize(a)) === JSON.stringify(normalize(b));
+  return stableJson(cleanPayload(normalize(a))) === stableJson(cleanPayload(normalize(b)));
 }
 async function sbPullRows(userId) {
   if (!sb) throw new Error("Supabase client unavailable");
@@ -749,6 +791,7 @@ function exportXLSX(entries, cats, contacts) {
 // ══════════════════════════════════════════════════════════
 //  공통 UI 컴포넌트
 // ══════════════════════════════════════════════════════════
+
 const Lbl = ({
   children
 }) => /*#__PURE__*/React.createElement("div", {
@@ -860,6 +903,7 @@ function Card({
   onDelete,
   onToggle
 }) {
+  const [expanded, setExpanded] = useState(false);
   const cat = cats.find(c => c.id === entry.category) || cats[0] || {
     color: "#888"
   };
@@ -927,16 +971,48 @@ function Card({
       color: "#27ae60",
       fontWeight: 700
     }
-  }, "\u2713 \uC644\uB8CC")), /*#__PURE__*/React.createElement("div", {
+  }, "\u2713 \uC644\uB8CC")), /*#__PURE__*/React.createElement("button", {
+    type: "button",
+    "aria-expanded": expanded,
+    "aria-controls": `task-details-${entry.id}`,
+    onClick: () => setExpanded(v => !v),
     style: {
+      display: "block",
+      width: "100%",
+      padding: 0,
+      border: 0,
+      background: "transparent",
+      textAlign: "left",
+      cursor: "pointer",
+      fontFamily: "inherit",
       fontSize: 15,
-      fontWeight: 600,
-      lineHeight: 1.4,
+      fontWeight: 700,
+      lineHeight: 1.5,
       wordBreak: "break-word",
-      color: entry.done ? "#999" : "#1a1a2e",
+      color: entry.done ? "#888" : "#1a1a2e",
       textDecoration: entry.done ? "line-through" : "none"
     }
-  }, entry.title), entry.bodyHtml ? /*#__PURE__*/React.createElement("div", {
+  }, entry.title, /*#__PURE__*/React.createElement("span", {
+    style: {
+      marginLeft: 8,
+      fontSize: 11,
+      color: "#777",
+      fontWeight: 400
+    }
+  }, expanded ? "▴ 접기" : "▾ 펼치기")), !expanded && /*#__PURE__*/React.createElement("div", {
+    style: {
+      marginTop: 6,
+      fontSize: 11,
+      color: "#999"
+    }
+  }, [entry.body || entry.bodyHtml ? "메모 있음" : "", entry.photos?.length || entry.photo ? `사진 ${entry.photos?.length || 1}장` : "", entry.attachments?.length ? `첨부 ${entry.attachments.length}개` : ""].filter(Boolean).join(" · ")), expanded && /*#__PURE__*/React.createElement("div", {
+    id: `task-details-${entry.id}`,
+    style: {
+      borderTop: "1px solid #eee",
+      paddingTop: 10,
+      marginTop: 10
+    }
+  }, entry.bodyHtml ? /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 14,
       color: entry.done ? "#bbb" : "#666",
@@ -982,7 +1058,33 @@ function Card({
       color: "#ccc",
       marginTop: 5
     }
-  }, fmtTs(entry.updatedAt))), /*#__PURE__*/React.createElement("div", {
+  }, fmtTs(entry.updatedAt)), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginTop: 12
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: () => onEdit(entry),
+    style: {
+      padding: "7px 12px",
+      border: "1px solid #ddd",
+      borderRadius: 7,
+      background: "#fff",
+      color: "#444",
+      cursor: "pointer"
+    }
+  }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => onDelete(entry.id),
+    style: {
+      padding: "7px 12px",
+      border: "1px solid #fcc",
+      borderRadius: 7,
+      background: "#fff",
+      color: "#c0392b",
+      cursor: "pointer"
+    }
+  }, "\uC0AD\uC81C")))), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
@@ -1002,31 +1104,7 @@ function Card({
       color: entry.done ? "#888" : "#16854b",
       minWidth: 44
     }
-  }, entry.done ? "↩ 미완료로" : "✓ 완료"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => onEdit(entry),
-    style: {
-      padding: "5px 8px",
-      border: "1px solid #ddd",
-      borderRadius: 6,
-      background: "#fff",
-      fontSize: 11,
-      cursor: "pointer",
-      color: "#444",
-      minWidth: 44
-    }
-  }, "\uC218\uC815"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => onDelete(entry.id),
-    style: {
-      padding: "5px 8px",
-      border: "1px solid #fcc",
-      borderRadius: 6,
-      background: "#fff",
-      fontSize: 11,
-      cursor: "pointer",
-      color: "#c0392b",
-      minWidth: 44
-    }
-  }, "\uC0AD\uC81C")));
+  }, entry.done ? "↩ 미완료로" : "✓ 완료")));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -2096,6 +2174,7 @@ function CatManageModal({
 //  담당자 연락처 탭
 // ══════════════════════════════════════════════════════════
 // 담당자 탭 전용 저장 버튼 (상태 피드백 포함)
+
 function SaveBtn({
   list,
   onForceSave
@@ -2821,242 +2900,219 @@ function ContactForm({
 // ══════════════════════════════════════════════════════════
 //  날짜별 / 태그별 탭
 // ══════════════════════════════════════════════════════════
+
 function DateView({
   entries,
   cats,
   onEdit,
+  selected,
+  onSelect,
+  onDelete,
+  onToggle,
   statusLabel = "미완료"
 }) {
-  const live = entries.filter(e => e.date);
-  const [year, setYear] = useState(() => new Date().getFullYear());
+  const [month, setMonth] = useState(() => todayStr().slice(0, 7));
   const [selectedDate, setSelectedDate] = useState(todayStr());
   const [showDetails, setShowDetails] = useState(true);
-  const todayMonthRef = useRef(null);
-  const catById = new Map(cats.map(c => [c.id, c]));
+  const [year, monthNumber] = month.split("-").map(Number);
   const byDate = {};
-  live.forEach(e => {
-    if (!byDate[e.date]) byDate[e.date] = [];
-    byDate[e.date].push(e);
+  entries.filter(e => e.date).forEach(e => {
+    (byDate[e.date] || (byDate[e.date] = [])).push(e);
   });
-  const selectedItems = (byDate[selectedDate] || []).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  const monthNames = ["1월", "2월", "3월", "4월", "5월", "6월", "7월", "8월", "9월", "10월", "11월", "12월"];
+  const selectedItems = (byDate[selectedDate] || []).slice().sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const catById = new Map(cats.map(c => [c.id, c]));
+  const first = new Date(year, monthNumber - 1, 1).getDay();
+  const total = new Date(year, monthNumber, 0).getDate();
+  const cells = Array.from({
+    length: Math.ceil((first + total) / 7) * 7
+  }, (_, i) => i >= first && i < first + total ? i - first + 1 : null);
   const weekLabels = ["일", "월", "화", "수", "목", "금", "토"];
   const today = todayStr();
-  useEffect(() => {
-    const frame = requestAnimationFrame(() => todayMonthRef.current?.scrollIntoView({
-      block: "start",
-      behavior: "instant"
-    }));
-    return () => cancelAnimationFrame(frame);
-  }, []);
-  useEffect(() => {
-    if (String(selectedDate).startsWith(String(year) + "-")) return;
-    const firstInYear = Object.keys(byDate).filter(date => date.startsWith(String(year) + "-")).sort()[0];
-    setSelectedDate(firstInYear || `${year}-01-01`);
-  }, [year]);
-  function monthDays(monthIndex) {
-    const first = new Date(year, monthIndex, 1);
-    const total = new Date(year, monthIndex + 1, 0).getDate();
-    const cells = [];
-    for (let i = 0; i < first.getDay(); i++) cells.push(null);
-    for (let d = 1; d <= total; d++) cells.push(`${year}-${pad(monthIndex + 1)}-${pad(d)}`);
-    while (cells.length % 7) cells.push(null);
-    return cells;
+  function changeMonth(value) {
+    setMonth(value);
+    setSelectedDate(value + "-01");
+    setShowDetails(true);
   }
-  function dotsFor(date) {
-    const colors = [];
-    (byDate[date] || []).forEach(e => {
-      const color = catById.get(e.category)?.color || "#7f8c8d";
-      if (!colors.includes(color)) colors.push(color);
-    });
-    return colors.slice(0, 4);
+  function moveMonth(delta) {
+    const date = new Date(year, monthNumber - 1 + delta, 1);
+    changeMonth(date.getFullYear() + "-" + pad(date.getMonth() + 1));
   }
-  return /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
-    style: {
-      position: "sticky",
-      top: 104,
-      zIndex: 120,
-      background: "#f2f2ef",
-      padding: "2px 0 12px",
-      marginBottom: 6
-    }
+  const usedCategories = cats.filter(c => entries.some(e => e.category === c.id && e.date?.startsWith(month + "-")));
+  return /*#__PURE__*/React.createElement("section", {
+    "aria-label": "\uC6D4\uBCC4 \uC5C5\uBB34 \uB2EC\uB825"
   }, /*#__PURE__*/React.createElement("div", {
     style: {
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "space-between",
-      gap: 10,
-      background: "#fff",
-      border: "1px solid #e5e5df",
-      borderRadius: 14,
-      padding: "12px 14px",
-      boxShadow: "0 2px 8px rgba(0,0,0,0.04)"
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setYear(y => y - 1),
-    style: {
-      border: "none",
-      background: "#f5f5f5",
-      borderRadius: 10,
-      width: 38,
-      height: 34,
-      fontSize: 18,
-      cursor: "pointer",
-      color: "#555"
-    }
-  }, "\u2039"), /*#__PURE__*/React.createElement("div", {
-    style: {
-      textAlign: "center"
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 22,
-      fontWeight: 900,
-      color: "#1a1a2e",
-      letterSpacing: -0.5
-    }
-  }, year), /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 11,
-      color: "#999",
-      marginTop: 2
-    }
-  }, "\uC791\uC131 \uB0A0\uC9DC \uAE30\uC900 \xB7 ", statusLabel, " \uD56D\uBAA9")), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setYear(y => y + 1),
-    style: {
-      border: "none",
-      background: "#f5f5f5",
-      borderRadius: 10,
-      width: 38,
-      height: 34,
-      fontSize: 18,
-      cursor: "pointer",
-      color: "#555"
-    }
-  }, "\u203A"))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "1fr",
-      gap: 14
-    }
-  }, monthNames.map((name, monthIndex) => /*#__PURE__*/React.createElement("div", {
-    key: name,
-    ref: monthIndex === new Date().getMonth() ? todayMonthRef : null,
-    style: {
-      scrollMarginTop: 230,
       background: "#fff",
       border: "1px solid #e5e5df",
       borderRadius: 16,
-      padding: "14px 12px",
-      boxShadow: "0 2px 10px rgba(0,0,0,0.035)"
+      padding: 16
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       alignItems: "center",
       justifyContent: "space-between",
-      marginBottom: 10
+      marginBottom: 14
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("div", {
     style: {
-      fontSize: 16,
-      fontWeight: 900,
+      fontSize: 24,
+      fontWeight: 800,
       color: "#1a1a2e"
     }
-  }, name), /*#__PURE__*/React.createElement("div", {
+  }, year, "\uB144"), /*#__PURE__*/React.createElement("div", {
     style: {
       fontSize: 11,
-      color: "#aaa"
+      color: "#888",
+      marginTop: 3
     }
-  }, live.filter(e => e.date?.startsWith(`${year}-${pad(monthIndex + 1)}`)).length, "\uAC74")), /*#__PURE__*/React.createElement("div", {
+  }, "\uC791\uC131 \uB0A0\uC9DC \uAE30\uC900 \xB7 ", statusLabel)), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      setMonth(today.slice(0, 7));
+      setSelectedDate(today);
+      setShowDetails(true);
+    },
+    style: {
+      padding: "8px 13px",
+      border: "1px solid #ddd",
+      borderRadius: 8,
+      background: "#fff",
+      cursor: "pointer"
+    }
+  }, "\uC624\uB298")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "space-between",
+      gap: 8,
+      marginBottom: 14
+    }
+  }, /*#__PURE__*/React.createElement("button", {
+    "aria-label": "\uC774\uC804 \uB2EC",
+    onClick: () => moveMonth(-1),
+    style: {
+      padding: "8px 14px",
+      border: 0,
+      borderRadius: 8,
+      background: "#f4f4f4",
+      cursor: "pointer",
+      fontSize: 20
+    }
+  }, "\u2039"), /*#__PURE__*/React.createElement("label", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 8,
+      fontSize: 13,
+      fontWeight: 700
+    }
+  }, "\uC6D4 \uC774\uB3D9 ", /*#__PURE__*/React.createElement("input", {
+    "aria-label": "\uD45C\uC2DC\uD560 \uC5F0\uC6D4",
+    type: "month",
+    value: month,
+    onChange: e => {
+      if (/^\d{4}-\d{2}$/.test(e.target.value)) changeMonth(e.target.value);
+    },
+    style: {
+      padding: 7,
+      border: "1px solid #ddd",
+      borderRadius: 7,
+      fontFamily: "inherit",
+      maxWidth: 160
+    }
+  })), /*#__PURE__*/React.createElement("button", {
+    "aria-label": "\uB2E4\uC74C \uB2EC",
+    onClick: () => moveMonth(1),
+    style: {
+      padding: "8px 14px",
+      border: 0,
+      borderRadius: 8,
+      background: "#f4f4f4",
+      cursor: "pointer",
+      fontSize: 20
+    }
+  }, "\u203A")), /*#__PURE__*/React.createElement("div", {
     style: {
       display: "grid",
-      gridTemplateColumns: "repeat(7,1fr)",
-      gap: 4,
-      marginBottom: 5
-    }
-  }, weekLabels.map(w => /*#__PURE__*/React.createElement("div", {
-    key: w,
-    style: {
-      fontSize: 10,
-      fontWeight: 800,
-      color: w === "일" ? "#e74c3c" : w === "토" ? "#2980b9" : "#aaa",
-      textAlign: "center",
-      padding: "3px 0"
-    }
-  }, w))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "repeat(7,1fr)",
+      gridTemplateColumns: "repeat(7,minmax(0,1fr))",
       gap: 4
     }
-  }, monthDays(monthIndex).map((date, i) => {
-    const day = date ? Number(date.slice(8, 10)) : null;
-    const items = byDate[date] || [];
-    const hasItems = items.length > 0;
+  }, weekLabels.map((w, i) => /*#__PURE__*/React.createElement("div", {
+    key: w,
+    style: {
+      padding: "5px 0",
+      textAlign: "center",
+      fontSize: 12,
+      color: i === 0 ? "#c0392b" : i === 6 ? "#2980b9" : "#888"
+    }
+  }, w)), cells.map((day, i) => {
+    if (!day) return /*#__PURE__*/React.createElement("div", {
+      key: "blank" + i
+    });
+    const date = month + "-" + pad(day);
     const active = date === selectedDate;
-    const isToday = date === today;
+    const colors = [...new Set((byDate[date] || []).map(e => catById.get(e.category)?.color || "#888"))];
     return /*#__PURE__*/React.createElement("button", {
-      key: date || "blank" + i,
-      disabled: !date,
-      "aria-label": date || undefined,
-      "aria-pressed": date ? active : undefined,
+      key: date,
+      "aria-label": date + " 업무 " + (byDate[date]?.length || 0) + "건",
+      "aria-pressed": active,
       onClick: () => {
-        if (date) {
-          setSelectedDate(date);
-          setShowDetails(true);
-        }
+        setSelectedDate(date);
+        setShowDetails(true);
       },
       style: {
-        minHeight: 46,
-        border: active ? "2px solid #1a1a2e" : isToday ? "1.5px solid #e74c3c" : "1px solid transparent",
-        borderRadius: 10,
-        background: active ? "#f0f0ff" : hasItems ? "#fbfbfb" : "transparent",
-        cursor: date ? "pointer" : "default",
-        padding: "5px 2px",
+        minHeight: 54,
+        padding: "7px 2px",
         display: "flex",
         flexDirection: "column",
         alignItems: "center",
-        justifyContent: "flex-start",
-        gap: 4
+        gap: 6,
+        border: active ? "2px solid #1a1a2e" : date === today ? "2px solid #e74c3c" : "2px solid transparent",
+        borderRadius: 10,
+        background: active ? "#ededf9" : "#fafafa",
+        cursor: "pointer",
+        color: i % 7 === 0 ? "#c0392b" : i % 7 === 6 ? "#2980b9" : "#333"
       }
-    }, date && /*#__PURE__*/React.createElement("span", {
+    }, /*#__PURE__*/React.createElement("span", {
       style: {
-        fontSize: 12,
-        fontWeight: active || isToday ? 900 : 600,
-        color: active ? "#1a1a2e" : day === null ? "transparent" : "#555"
+        fontSize: 14,
+        fontWeight: active || date === today ? 800 : 500
       }
-    }, day), hasItems && /*#__PURE__*/React.createElement("div", {
+    }, day), /*#__PURE__*/React.createElement("span", {
       style: {
         display: "flex",
-        gap: 2,
+        gap: 3,
         flexWrap: "wrap",
-        justifyContent: "center",
-        maxWidth: 28
+        justifyContent: "center"
       }
-    }, dotsFor(date).map((color, idx) => /*#__PURE__*/React.createElement("span", {
-      key: color + idx,
+    }, colors.map(color => /*#__PURE__*/React.createElement("span", {
+      key: color,
       style: {
         width: 5,
         height: 5,
         borderRadius: "50%",
-        background: color,
-        display: "inline-block"
+        background: color
       }
     }))));
-  }))))), showDetails && /*#__PURE__*/React.createElement("div", {
+  })), usedCategories.length > 0 && /*#__PURE__*/React.createElement("div", {
     style: {
-      position: "sticky",
-      bottom: 66,
-      zIndex: 110,
-      marginTop: 16,
-      maxHeight: "42vh",
-      overflowY: "auto",
-      background: "#fff",
-      border: "1px solid #e5e5df",
-      borderRadius: 16,
-      padding: "14px",
-      boxShadow: "0 -2px 14px rgba(0,0,0,0.08)"
+      display: "flex",
+      flexWrap: "wrap",
+      gap: 10,
+      marginTop: 14,
+      fontSize: 11,
+      color: "#777"
+    }
+  }, usedCategories.map(c => /*#__PURE__*/React.createElement("span", {
+    key: c.id
+  }, /*#__PURE__*/React.createElement("span", {
+    style: {
+      color: c.color
+    }
+  }, "\u25CF"), " ", c.label)))), showDetails && /*#__PURE__*/React.createElement("section", {
+    "aria-label": "\uC120\uD0DD\uD55C \uB0A0\uC9DC\uC758 \uC5C5\uBB34",
+    style: {
+      marginTop: 16
     }
   }, /*#__PURE__*/React.createElement("div", {
     style: {
@@ -3066,92 +3122,39 @@ function DateView({
       gap: 8,
       marginBottom: 10
     }
-  }, /*#__PURE__*/React.createElement("div", {
+  }, /*#__PURE__*/React.createElement("h3", {
     style: {
-      fontSize: 14,
-      fontWeight: 900,
+      fontSize: 15,
       color: "#1a1a2e"
     }
-  }, "\uD83D\uDCCC ", selectedDate), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      alignItems: "center",
-      gap: 12
-    }
-  }, /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 11,
-      color: "#999"
-    }
-  }, selectedItems.length, "\uAC74"), /*#__PURE__*/React.createElement("button", {
+  }, selectedDate, " \xB7 ", selectedItems.length, "\uAC74"), /*#__PURE__*/React.createElement("button", {
     onClick: () => setShowDetails(false),
     "aria-label": "\uB0A0\uC9DC\uBCC4 \uC5C5\uBB34 \uBAA9\uB85D \uB2EB\uAE30",
     style: {
-      padding: "7px 12px",
+      padding: "8px 12px",
       border: "1px solid #ddd",
       borderRadius: 8,
-      background: "#f5f5f5",
-      color: "#555",
+      background: "#fff",
       cursor: "pointer"
     }
-  }, "\uB2EB\uAE30 \u2715"))), selectedItems.length ? /*#__PURE__*/React.createElement("div", {
+  }, "\uB2EB\uAE30 \u2715")), selectedItems.length ? /*#__PURE__*/React.createElement("div", {
     style: {
       display: "flex",
       flexDirection: "column",
-      gap: 7
+      gap: 8
     }
-  }, selectedItems.map(e => {
-    const cat = catById.get(e.category) || {
-      label: e.category,
-      color: "#7f8c8d",
-      icon: "•"
-    };
-    return /*#__PURE__*/React.createElement("button", {
-      key: e.id,
-      onClick: () => onEdit(e),
-      style: {
-        display: "flex",
-        alignItems: "center",
-        gap: 8,
-        textAlign: "left",
-        border: "1px solid #eee",
-        borderRadius: 10,
-        background: "#fafafa",
-        padding: "9px 10px",
-        cursor: "pointer"
-      }
-    }, /*#__PURE__*/React.createElement("span", {
-      style: {
-        width: 9,
-        height: 9,
-        borderRadius: "50%",
-        background: cat.color,
-        flexShrink: 0
-      }
-    }), /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontSize: 11,
-        color: cat.color,
-        fontWeight: 800,
-        whiteSpace: "nowrap"
-      }
-    }, cat.label), /*#__PURE__*/React.createElement("span", {
-      style: {
-        fontSize: 13,
-        color: "#1a1a2e",
-        fontWeight: 700,
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-        whiteSpace: "nowrap"
-      }
-    }, e.done ? "✓ " : "", e.title || "(제목 없음)"));
-  })) : /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontSize: 12,
-      color: "#aaa",
-      padding: "4px 0"
-    }
-  }, "\uC774 \uB0A0\uC9DC\uC5D0 \uC791\uC131\uB41C ", statusLabel, " \uD56D\uBAA9\uC774 \uC5C6\uC2B5\uB2C8\uB2E4.")));
+  }, selectedItems.map(e => /*#__PURE__*/React.createElement(Card, {
+    key: e.id,
+    entry: e,
+    cats: cats,
+    selected: selected.has(e.id),
+    onSelect: onSelect,
+    onEdit: onEdit,
+    onDelete: onDelete,
+    onToggle: onToggle
+  }))) : /*#__PURE__*/React.createElement(Empty, {
+    text: "이 날짜에 작성된 " + statusLabel + " 업무가 없습니다."
+  })));
 }
 function TagView({
   entries,
@@ -3212,6 +3215,7 @@ function TagView({
 // ══════════════════════════════════════════════════════════
 //  사진 뷰어 (확대/축소 + 네비게이션 + 다운로드)
 // ══════════════════════════════════════════════════════════
+
 function PhotoViewer({
   photos,
   startIndex,
@@ -3530,6 +3534,7 @@ const Empty = ({
 // ══════════════════════════════════════════════════════════
 //  비밀번호 변경 모달
 // ══════════════════════════════════════════════════════════
+
 function PasswordModal({
   onClose
 }) {
@@ -4220,6 +4225,11 @@ function App({
   const lastRealtimeAtRef = useRef(null);
   const lastErrorRef = useRef("");
   const localDirtyRef = useRef(false); // 사용자가 로컬에서 변경했을 때만 true → push 발생
+  const editRevisionRef = useRef(0);
+  function markDirty() {
+    editRevisionRef.current += 1;
+    localDirtyRef.current = true;
+  }
 
   // ── IndexedDB 초기 로드 ──────────────────────────────
   useEffect(() => {
@@ -4295,6 +4305,7 @@ function App({
               lastPullAtRef.current = Date.now();
               const {
                 entries: curE,
+                cats: curC,
                 contacts: curCon
               } = dataRef.current;
               const preferLocal = localDirtyRef.current;
@@ -4303,12 +4314,12 @@ function App({
               const needsPush = preferLocal || !sameRecords(mergedEntries, remote.entries || [], migrateEntry) || !sameRecords(mergedContacts, remote.contacts || [], migrateContact);
               dataRef.current = {
                 entries: mergedEntries,
-                cats: remote.cats?.length ? remote.cats : dataRef.current.cats,
+                cats: preferLocal ? curC : remote.cats?.length ? remote.cats : curC,
                 contacts: mergedContacts
               };
               setEntries(mergedEntries);
               setContacts(mergedContacts);
-              if (remote.cats?.length) setCats(remote.cats);
+              setCats(dataRef.current.cats);
               localDirtyRef.current = needsPush;
             }
             lastErrorRef.current = "";
@@ -4340,18 +4351,23 @@ function App({
       if (!localDirtyRef.current) return;
       setSyncStatus("syncing");
       try {
+        const remote = await withRetry(() => sbPullRows(user.id));
         const {
           entries: e,
           cats: c,
           contacts: con
         } = dataRef.current;
-        const remote = await withRetry(() => sbPullRows(user.id));
+        const revision = editRevisionRef.current;
         const mergedEntries = mergeRecords(e, remote?.entries || [], migrateEntry, true).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         const mergedContacts = mergeRecords(con, remote?.contacts || [], migrateContact, true);
         const mergedCats = c?.length ? c : remote?.cats || DEFAULT_CATS;
         await withRetry(() => sbPushRows(user.id, mergedEntries, mergedCats, mergedContacts));
         lastPushAtRef.current = Date.now();
         lastErrorRef.current = "";
+        if (revision !== editRevisionRef.current) {
+          setSyncStatus("ok");
+          return;
+        }
         dataRef.current = {
           entries: mergedEntries,
           cats: mergedCats,
@@ -4377,6 +4393,7 @@ function App({
 
   // ── 탭/창 활성화 시 자동 Pull (기기 전환 대응) ────────
   useEffect(() => {
+    if (!dbReady) return;
     const handle = () => {
       if (!document.hidden) pullAndMerge();
     };
@@ -4386,7 +4403,7 @@ function App({
       document.removeEventListener("visibilitychange", handle);
       window.removeEventListener("focus", handle);
     };
-  }, [pullAndMerge]);
+  }, [pullAndMerge, dbReady]);
 
   // ── 온라인/오프라인 전환 처리 ─────────────────────────
   useEffect(() => {
@@ -4445,6 +4462,7 @@ function App({
     syncPushTimer.current = setTimeout(() => {
       flushPush();
     }, 1500);
+    return () => clearTimeout(syncPushTimer.current);
   }, [entries, cats, contacts, dbReady, flushPush]);
 
   // ── 항목 CRUD ────────────────────────────────────────
@@ -4456,7 +4474,7 @@ function App({
   });
   const closeModal = () => setModal(null);
   function submitForm(form) {
-    localDirtyRef.current = true;
+    markDirty();
     const now = Date.now();
     if (modal.entry) setEntries(p => p.map(e => e.id === modal.entry.id ? {
       ...form,
@@ -4475,7 +4493,7 @@ function App({
   }
   function deleteEntry(id) {
     if (!window.confirm("삭제하시겠습니까?")) return;
-    localDirtyRef.current = true;
+    markDirty();
     const now = Date.now();
     setEntries(p => p.map(e => e.id === id ? {
       ...e,
@@ -4489,7 +4507,7 @@ function App({
     });
   }
   function toggleDone(id) {
-    localDirtyRef.current = true;
+    markDirty();
     setEntries(p => p.map(e => e.id === id ? {
       ...e,
       done: !e.done,
@@ -4506,7 +4524,7 @@ function App({
     });
   }
   function markDone(val) {
-    localDirtyRef.current = true;
+    markDirty();
     setEntries(p => p.map(e => selected.has(e.id) ? {
       ...e,
       done: val,
@@ -4515,7 +4533,7 @@ function App({
     setSelected(new Set());
   }
   function deleteSelected() {
-    localDirtyRef.current = true;
+    markDirty();
     const now = Date.now();
     setEntries(p => p.map(e => selected.has(e.id) ? {
       ...e,
@@ -4541,6 +4559,7 @@ function App({
           cats: curC,
           contacts: curCon
         } = dataRef.current;
+        const revision = editRevisionRef.current;
         const finalEntries = mergeRecords(curE, remote?.entries || [], migrateEntry, true).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
         const finalCats = curC?.length ? curC : remote?.cats || DEFAULT_CATS;
         const finalContacts = mergeRecords(curCon, remote?.contacts || [], migrateContact, true);
@@ -4555,7 +4574,7 @@ function App({
         await withRetry(() => sbPushRows(user.id, finalEntries, finalCats, finalContacts));
         lastPushAtRef.current = Date.now();
         lastErrorRef.current = "";
-        localDirtyRef.current = false;
+        localDirtyRef.current = revision !== editRevisionRef.current;
         setSyncStatus("ok");
       });
       alert("동기화 완료!");
@@ -4569,7 +4588,7 @@ function App({
 
   // ── 분류 저장 ────────────────────────────────────────
   function saveCatsWithMigrate(newCats) {
-    localDirtyRef.current = true;
+    markDirty();
     const ids = new Set(newCats.map(c => c.id));
     const fallback = newCats[0]?.id;
     setEntries(p => p.map(e => ids.has(e.category) ? e : {
@@ -4613,7 +4632,7 @@ function App({
   // 담당자 저장 — dirty 플래그 + dataRef 즉시 동기화 (stale closure 방지)
   function saveContacts(next) {
     const snapshot = prepareContactSnapshot(next);
-    localDirtyRef.current = true;
+    markDirty();
     dataRef.current = {
       ...dataRef.current,
       contacts: snapshot
@@ -4624,7 +4643,8 @@ function App({
   // 담당자 탭 저장 버튼 — 즉시 Supabase push (디바운스 없음)
   async function forceSaveContacts(nextContacts) {
     const snapshot = prepareContactSnapshot(nextContacts);
-    localDirtyRef.current = true;
+    markDirty();
+    const revision = editRevisionRef.current;
     dataRef.current = {
       ...dataRef.current,
       contacts: snapshot
@@ -4647,6 +4667,10 @@ function App({
         await withRetry(() => sbPushRows(user.id, mergedEntries, c, mergedContacts));
         lastPushAtRef.current = Date.now();
         lastErrorRef.current = "";
+        if (revision !== editRevisionRef.current) {
+          setSyncStatus("ok");
+          return;
+        }
         dataRef.current = {
           entries: mergedEntries,
           cats: c,
@@ -4776,6 +4800,7 @@ function App({
       gap: 8
     }
   }, /*#__PURE__*/React.createElement("button", {
+    "aria-label": "\uBA54\uB274 \uC5F4\uAE30",
     onClick: () => setShowSidebar(s => !s),
     style: {
       background: "none",
@@ -4805,19 +4830,11 @@ function App({
       fontSize: 11,
       color: "#aaa"
     }
-  }, totalActive, "\uAC74"), /*#__PURE__*/React.createElement("span", {
-    className: "header-count",
-    style: {
-      fontSize: 10,
-      color: "#aaa",
-      maxWidth: 120,
-      overflow: "hidden",
-      textOverflow: "ellipsis"
-    }
-  }, user.email), /*#__PURE__*/React.createElement("button", {
+  }, "\uBBF8\uC644\uB8CC ", totalActive, "\uAC74"), /*#__PURE__*/React.createElement("button", {
     className: "header-action",
-    onClick: manualSync,
-    title: syncStatus === "error" ? "동기화 오류 — 클릭하여 재시도" : syncStatus === "offline" ? "오프라인 — 연결되면 자동 동기화" : "지금 동기화",
+    onClick: () => setShowDiag(true),
+    title: "\uC800\uC7A5 \uC0C1\uD0DC \uBC0F \uB3D9\uAE30\uD654 \uC9C4\uB2E8 \uBCF4\uAE30",
+    "aria-label": "\uC800\uC7A5 \uC0C1\uD0DC \uBC0F \uB3D9\uAE30\uD654 \uC9C4\uB2E8 \uBCF4\uAE30",
     style: {
       padding: "7px 10px",
       background: syncStatus === "error" ? "rgba(231,76,60,0.2)" : "transparent",
@@ -4840,40 +4857,15 @@ function App({
     style: {
       fontSize: 10
     }
-  }, syncStatus === "syncing" ? "동기화중" : syncStatus === "ok" ? "동기화됨" : syncStatus === "error" ? "오류" : syncStatus === "offline" ? "오프라인" : "동기화")), /*#__PURE__*/React.createElement("button", {
-    className: "header-action",
-    onClick: () => exportXLSX(liveEntries, cats, liveContacts),
-    style: {
-      padding: "7px 10px",
-      background: "#27ae60",
-      color: "#fff",
-      border: "none",
-      borderRadius: 7,
-      fontSize: 12,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "\uD83D\uDCCA \uC5D1\uC140"), /*#__PURE__*/React.createElement("button", {
-    className: "header-action",
-    onClick: () => sb.auth.signOut(),
-    style: {
-      padding: "7px 10px",
-      background: "rgba(255,255,255,0.12)",
-      color: "#fff",
-      border: "1px solid rgba(255,255,255,0.2)",
-      borderRadius: 7,
-      fontSize: 12,
-      cursor: "pointer"
-    }
-  }, "\uB85C\uADF8\uC544\uC6C3"), /*#__PURE__*/React.createElement("button", {
+  }, syncStatus === "syncing" ? "동기화중" : syncStatus === "ok" ? "동기화됨" : syncStatus === "error" ? "오류" : syncStatus === "offline" ? "오프라인" : "동기화")), tab !== "contact" && /*#__PURE__*/React.createElement("button", {
     className: "header-action",
     onClick: openNew,
     style: {
-      padding: "7px 12px",
+      padding: "9px 14px",
       background: "#e74c3c",
       color: "#fff",
       border: "none",
-      borderRadius: 7,
+      borderRadius: 9,
       fontSize: 13,
       fontWeight: 700,
       cursor: "pointer"
@@ -4895,20 +4887,46 @@ function App({
     },
     onClick: () => setShowSidebar(false)
   }, /*#__PURE__*/React.createElement("div", {
+    role: "dialog",
+    "aria-label": "\uC5C5\uBB34\uC218\uCCA9 \uBA54\uB274",
     onClick: e => e.stopPropagation(),
     style: {
       position: "absolute",
       top: 0,
       left: 0,
-      width: 240,
+      width: "min(320px,90vw)",
       height: "100%",
       background: "#fff",
       boxShadow: "4px 0 20px rgba(0,0,0,0.15)",
       overflowY: "auto",
-      paddingTop: 60,
+      padding: "20px 0 30px",
       boxSizing: "border-box"
     }
   }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      justifyContent: "space-between",
+      alignItems: "center",
+      padding: "0 16px 14px"
+    }
+  }, /*#__PURE__*/React.createElement("strong", null, "\uC5C5\uBB34\uC218\uCCA9 \uBA54\uB274"), /*#__PURE__*/React.createElement("button", {
+    "aria-label": "\uBA54\uB274 \uB2EB\uAE30",
+    onClick: () => setShowSidebar(false),
+    style: {
+      padding: 8,
+      border: 0,
+      borderRadius: 6,
+      background: "#eee",
+      cursor: "pointer"
+    }
+  }, "\uB2EB\uAE30 \u2715")), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12,
+      color: "#888",
+      padding: "0 16px 14px",
+      overflowWrap: "anywhere"
+    }
+  }, user.email), /*#__PURE__*/React.createElement("div", {
     style: {
       padding: "12px 14px 8px",
       fontSize: 11,
@@ -4931,6 +4949,7 @@ function App({
     key: cat.id,
     onClick: () => {
       setCatFilter(cat.id);
+      setSelected(new Set());
       setTab("list");
       setShowSidebar(false);
     },
@@ -5033,7 +5052,36 @@ function App({
       color: "#16854b",
       cursor: "pointer"
     }
-  }, "\u2713 \uC644\uB8CC\uD55C \uC5C5\uBB34 \uBCF4\uAE30")))), /*#__PURE__*/React.createElement("div", {
+  }, "\u2713 \uC644\uB8CC\uD55C \uC5C5\uBB34 \uBCF4\uAE30"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      exportXLSX(liveEntries, cats, liveContacts);
+      setShowSidebar(false);
+    },
+    style: {
+      padding: 10,
+      border: "1px solid #ddd",
+      borderRadius: 8,
+      background: "#fff",
+      color: "#16854b",
+      cursor: "pointer"
+    }
+  }, "\uD83D\uDCCA \uC804\uCCB4 \uB370\uC774\uD130 \uC5D1\uC140 \uB0B4\uBCF4\uB0B4\uAE30"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      if (localDirtyRef.current) {
+        alert("저장 대기 중인 변경이 있습니다. 동기화를 완료한 뒤 로그아웃해 주세요.");
+        return;
+      }
+      sb.auth.signOut();
+    },
+    style: {
+      padding: 10,
+      border: "1px solid #ddd",
+      borderRadius: 8,
+      background: "#fff",
+      color: "#666",
+      cursor: "pointer"
+    }
+  }, "\uB85C\uADF8\uC544\uC6C3")))), /*#__PURE__*/React.createElement("div", {
     style: {
       background: "#fff",
       borderBottom: "1px solid #e0e0da",
@@ -5078,11 +5126,34 @@ function App({
     }
   }, "\uD83D\uDC64 \uB2F4\uB2F9\uC790"))), /*#__PURE__*/React.createElement("div", {
     style: {
-      padding: "14px 14px 80px",
-      maxWidth: 700,
+      padding: "16px 14px calc(96px + env(safe-area-inset-bottom))",
+      maxWidth: 760,
       margin: "0 auto"
     }
-  }, ["list", "date", "tag"].includes(tab) && /*#__PURE__*/React.createElement("div", {
+  }, (syncStatus === "error" || syncStatus === "offline") && /*#__PURE__*/React.createElement("div", {
+    role: "status",
+    style: {
+      marginBottom: 14,
+      padding: 12,
+      border: "1px solid #e8c5b6",
+      borderRadius: 10,
+      background: "#fff5ef",
+      color: "#8b4123",
+      fontSize: 12,
+      lineHeight: 1.6
+    }
+  }, syncStatus === "offline" ? "오프라인입니다. 변경 내용은 이 기기에 보관되며 연결 후 동기화합니다." : "클라우드 동기화를 완료하지 못했습니다. 진단에서 오류를 확인하고 다시 시도해 주세요.", /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowDiag(true),
+    style: {
+      marginLeft: 8,
+      padding: 6,
+      border: 0,
+      background: "transparent",
+      textDecoration: "underline",
+      color: "inherit",
+      cursor: "pointer"
+    }
+  }, "\uC0C1\uD0DC \uD655\uC778")), ["list", "date", "tag"].includes(tab) && /*#__PURE__*/React.createElement("div", {
     role: "group",
     "aria-label": "\uC5C5\uBB34 \uC0C1\uD0DC \uD544\uD130",
     style: {
@@ -5182,7 +5253,11 @@ function App({
     entries: statusEntries,
     statusLabel: statusLabel,
     cats: cats,
-    onEdit: openEdit
+    selected: selected,
+    onSelect: toggleSelect,
+    onEdit: openEdit,
+    onDelete: deleteEntry,
+    onToggle: toggleDone
   }), tab === "tag" && /*#__PURE__*/React.createElement(TagView, {
     entries: statusEntries,
     cats: cats,
@@ -5195,27 +5270,7 @@ function App({
     contacts: liveContacts,
     onSave: saveContacts,
     onForceSave: forceSaveContacts
-  })), tab !== "contact" && /*#__PURE__*/React.createElement("button", {
-    onClick: openNew,
-    style: {
-      position: "fixed",
-      bottom: 24,
-      right: 20,
-      width: 56,
-      height: 56,
-      borderRadius: "50%",
-      background: "#e74c3c",
-      color: "#fff",
-      border: "none",
-      fontSize: 28,
-      cursor: "pointer",
-      boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
-      zIndex: 150,
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center"
-    }
-  }, "+"), modal && /*#__PURE__*/React.createElement(EntryModal, {
+  })), modal && /*#__PURE__*/React.createElement(EntryModal, {
     initial: modal.entry || blankForm(),
     cats: cats,
     onSubmit: submitForm,
@@ -5332,6 +5387,7 @@ function App({
       cursor: "pointer"
     }
   }, "\uC9C0\uAE08 \uB3D9\uAE30\uD654 \uC7AC\uC2DC\uB3C4"))), /*#__PURE__*/React.createElement("nav", {
+    "aria-label": "\uC8FC\uC694 \uD654\uBA74",
     style: {
       position: "fixed",
       bottom: 0,
@@ -5342,12 +5398,15 @@ function App({
       borderTop: "1px solid #e0e0da",
       display: "flex",
       alignItems: "stretch",
+      paddingBottom: "env(safe-area-inset-bottom)",
       boxShadow: "0 -2px 12px rgba(0,0,0,0.08)"
     }
   }, NAV_TABS.map(t => /*#__PURE__*/React.createElement("button", {
     key: t.id,
+    "aria-current": tab === t.id ? "page" : undefined,
     onClick: () => {
       if (t.id === "date") setCalendarVisit(v => v + 1);
+      setSelected(new Set());
       setTab(t.id);
     },
     style: {
@@ -5394,5 +5453,12 @@ function App({
 const domRoot = ReactDOM.createRoot(document.getElementById('root'));
 domRoot.render(React.createElement(AuthGate));
 </script>
+
+
+
+
+
+
+
 </body>
 </html>
