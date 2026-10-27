@@ -606,7 +606,7 @@ function Card({entry,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
           {entry.done&&<span style={{fontSize:10,color:"#27ae60",fontWeight:700}}>✓ 완료</span>}
         </div>
         <div style={{fontSize:15,fontWeight:600,lineHeight:1.4,wordBreak:"break-word",color:entry.done?"#999":"#1a1a2e",textDecoration:entry.done?"line-through":"none"}}>{entry.title}</div>
-        {entry.body&&<div style={{fontSize:13,color:entry.done?"#bbb":"#666",marginTop:5,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.6}}>{entry.body}</div>}
+        {entry.bodyHtml?<div style={{fontSize:14,color:entry.done?"#bbb":"#666",marginTop:5,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.6}} dangerouslySetInnerHTML={{__html:sanitizeMemoHtml(entry.bodyHtml)}}/>:entry.body&&<div style={{fontSize:13,color:entry.done?"#bbb":"#666",marginTop:5,whiteSpace:"pre-wrap",wordBreak:"break-word",lineHeight:1.6}}>{entry.body}</div>}
         <div style={{opacity:entry.done?0.5:1}}>
           <PhotoGallery photos={entry.photos||(entry.photo?[entry.photo]:[])} />
           <AttachList attachments={entry.attachments||[]}/>
@@ -674,19 +674,84 @@ function SelectionBar({selected,entries,cats,onClear,onMarkDone,onMarkUndone,onD
 // ══════════════════════════════════════════════════════════
 //  항목 입력 모달
 // ══════════════════════════════════════════════════════════
+// Store only a small, inert subset of HTML; body stays plain text for search/export.
+function sanitizeMemoHtml(html) {
+  const source=new DOMParser().parseFromString(String(html||""),"text/html");
+  const output=document.createElement("div");
+  const allowed=new Set(["B","STRONG","SPAN","DIV","P","BR","FONT"]);
+  const blocked=new Set(["SCRIPT","STYLE","IFRAME","OBJECT","SVG","MATH","TEMPLATE"]);
+  function copy(node,parent){
+    if(node.nodeType===3){parent.appendChild(document.createTextNode(node.textContent));return;}
+    if(node.nodeType!==1||blocked.has(node.tagName))return;
+    if(!allowed.has(node.tagName)){Array.from(node.childNodes).forEach(n=>copy(n,parent));return;}
+    const el=document.createElement(node.tagName==="FONT"?"span":node.tagName.toLowerCase());
+    const color=node.style.color||node.getAttribute("color")||"";
+    if(/^(#[0-9a-f]{3,8}|rgba?\([\d\s.,%]+\)|[a-z]+)$/i.test(color))el.style.color=color;
+    const size=node.style.fontSize||({2:"12px",3:"14px",5:"20px"}[node.getAttribute("size")]||"");
+    if(["12px","14px","20px"].includes(size))el.style.fontSize=size;
+    if(["bold","700"].includes(node.style.fontWeight))el.style.fontWeight="700";
+    Array.from(node.childNodes).forEach(n=>copy(n,el));parent.appendChild(el);
+  }
+  Array.from(source.body.childNodes).forEach(n=>copy(n,output));
+  return output.innerHTML;
+}
+
+function MemoEditor({initial,onChange}) {
+  const editor=useRef(null);
+  const selection=useRef(null);
+  useEffect(()=>{
+    const el=editor.current;
+    if(initial.bodyHtml)el.innerHTML=sanitizeMemoHtml(initial.bodyHtml);
+    else el.textContent=initial.body||"";
+    function remember(){
+      const s=window.getSelection();
+      if(s?.rangeCount&&el.contains(s.anchorNode)&&el.contains(s.focusNode))selection.current=s.getRangeAt(0).cloneRange();
+    }
+    document.addEventListener("selectionchange",remember);
+    return ()=>document.removeEventListener("selectionchange",remember);
+  },[]);
+  function emit(){
+    const el=editor.current;
+    onChange({body:el.innerText,bodyHtml:sanitizeMemoHtml(el.innerHTML)});
+  }
+  function format(command,value){
+    const el=editor.current;el.focus();
+    const s=window.getSelection();
+    if(selection.current&&el.contains(selection.current.commonAncestorContainer)){
+      s.removeAllRanges();s.addRange(selection.current);
+    }
+    document.execCommand(command,false,value);
+    if(s.rangeCount)selection.current=s.getRangeAt(0).cloneRange();
+    emit();
+  }
+  const buttonStyle={padding:"7px 10px",border:"1px solid #ddd",borderRadius:7,background:"#fff",cursor:"pointer",fontSize:13};
+  return <div style={{marginBottom:12}}>
+    <div role="toolbar" aria-label="메모 서식" style={{display:"flex",gap:6,flexWrap:"wrap",alignItems:"center",padding:8,background:"#f6f6f6",border:"1px solid #ddd",borderRadius:"8px 8px 0 0"}}>
+      <button type="button" title="선택한 글씨 굵게" onMouseDown={e=>e.preventDefault()} onClick={()=>format("bold")} style={{...buttonStyle,fontWeight:800}}>굵게 B</button>
+      <select aria-label="글씨 크기" defaultValue="" onChange={e=>{format("fontSize",e.target.value);e.target.value="";}} style={buttonStyle}>
+        <option value="" disabled>글씨 크기</option><option value="2">작게 (12)</option><option value="3">보통 (14)</option><option value="5">크게 (20)</option>
+      </select>
+      {[['기본','#666666'],['빨강','#c0392b'],['파랑','#2980b9'],['초록','#16854b'],['보라','#8e44ad']].map(([label,color])=><button key={color} type="button" aria-label={label+" 글씨"} title={label} onMouseDown={e=>e.preventDefault()} onClick={()=>format("foreColor",color)} style={{...buttonStyle,padding:8}}><span style={{display:"block",width:16,height:16,borderRadius:"50%",background:color}}/></button>)}
+      <button type="button" onMouseDown={e=>e.preventDefault()} onClick={()=>format("removeFormat")} style={buttonStyle}>서식 지우기</button>
+    </div>
+    <div ref={editor} contentEditable suppressContentEditableWarning role="textbox" aria-label="메모 내용" aria-multiline="true" onInput={emit} onBlur={emit}
+      onPaste={e=>{e.preventDefault();document.execCommand("insertText",false,e.clipboardData.getData("text/plain"));emit();}}
+      onDrop={e=>e.preventDefault()}
+      style={{width:"100%",padding:10,border:"1px solid #ddd",borderTop:0,borderRadius:"0 0 8px 8px",fontSize:14,minHeight:160,lineHeight:1.7,whiteSpace:"pre-wrap",overflowWrap:"anywhere",outlineOffset:2}}/>
+    <div style={{fontSize:11,color:"#888",marginTop:5}}>문장을 선택한 뒤 크기·굵기·색상을 지정하세요.</div>
+  </div>;
+}
+
 function EntryModal({initial,cats,onSubmit,onCancel}) {
   const [form,setForm]         = useState({...initial, photos:initial.photos||(initial.photo?[initial.photo]:[]), attachments:initial.attachments||[]});
   const [tagInput,setTagInput] = useState("");
   const [uploading,setUploading] = useState(false);
   const photoRef = useRef(null);
   const fileRef  = useRef(null);
-  const bodyRef  = useRef(null);
   const f=(k,v)=>setForm(p=>({...p,[k]:v}));
   const addTag=()=>{const t=tagInput.trim().replace(/^#/,"");if(!t||(form.tags||[]).includes(t)){setTagInput("");return;}f("tags",[...(form.tags||[]),t]);setTagInput("");};
   async function addPhotos(files){ setUploading(true); try{ const arr=await Promise.all(Array.from(files).map(uploadPhoto)); setForm(p=>({...p,photos:[...(p.photos||[]),...arr]})); } catch(e){ alert("사진 업로드 실패: "+(e?.message||e)); } finally{ setUploading(false); } }
   async function addFiles(files){ setUploading(true); try{ const atts=await Promise.all(Array.from(files).map(uploadAttachment)); setForm(p=>({...p,attachments:[...(p.attachments||[]),...atts]})); } catch(e){ alert("첨부 업로드 실패: "+(e?.message||e)); } finally{ setUploading(false); } }
-  const autoResize = el=>{ if(!el) return; el.style.height="auto"; el.style.height=Math.max(120,el.scrollHeight)+"px"; };
-  useEffect(()=>{ autoResize(bodyRef.current); },[]);
 
   return (
     <div style={{position:"fixed",inset:0,background:"rgba(0,0,0,0.55)",zIndex:300,display:"flex",alignItems:"flex-end",justifyContent:"center"}} onClick={onCancel}>
@@ -712,10 +777,7 @@ function EntryModal({initial,cats,onSubmit,onCancel}) {
           style={{width:"100%",padding:"11px 10px",border:"1px solid #ddd",borderRadius:8,fontSize:15,boxSizing:"border-box",marginBottom:12}}/>
 
         <Lbl>내용</Lbl>
-        <textarea ref={bodyRef} value={form.body}
-          onChange={e=>{ f("body",e.target.value); autoResize(e.target); }}
-          placeholder="세부 내용..." rows={6}
-          style={{width:"100%",padding:"10px",border:"1px solid #ddd",borderRadius:8,fontSize:14,resize:"none",boxSizing:"border-box",fontFamily:"inherit",marginBottom:12,minHeight:120,lineHeight:1.7,overflow:"hidden"}}/>
+        <MemoEditor initial={initial} onChange={value=>setForm(p=>({...p,...value}))}/>
 
         <Lbl>📷 사진 (여러 장 가능)</Lbl>
         <div style={{display:"flex",gap:6,flexWrap:"wrap",marginBottom:10,alignItems:"flex-start"}}>
