@@ -363,10 +363,6 @@ const NAV_TABS = [{
   label: "태그별",
   icon: "🏷️"
 }, {
-  id: "paste",
-  label: "텍스트",
-  icon: "✏️"
-}, {
   id: "contact",
   label: "담당자",
   icon: "👤"
@@ -2823,7 +2819,7 @@ function ContactForm({
 }
 
 // ══════════════════════════════════════════════════════════
-//  날짜별 / 태그별 / 텍스트 입력 탭
+//  날짜별 / 태그별 탭
 // ══════════════════════════════════════════════════════════
 function DateView({
   entries,
@@ -3211,212 +3207,6 @@ function TagView({
     onDelete: onDelete,
     onToggle: onToggle
   })))));
-}
-function PasteTab({
-  cats,
-  onAddEntry
-}) {
-  const [pasteText, setPasteText] = useState("");
-  const [stage, setStage] = useState("paste"); // "paste" | "assign"
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const [category, setCategory] = useState(cats[0]?.id || "task");
-  const [priority, setPriority] = useState("mid");
-  const [errMsg, setErrMsg] = useState("");
-  const bodyRef2 = useRef(null);
-  const autoResize2 = el => {
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = Math.max(100, el.scrollHeight) + "px";
-  };
-  function applyPaste() {
-    if (!pasteText.trim()) {
-      setErrMsg("텍스트를 입력해주세요.");
-      return;
-    }
-    const lines = pasteText.split("\n").map(l => l.trim()).filter(l => l);
-    setTitle(lines[0] || "");
-    setBody(lines.slice(1).join("\n"));
-    setCategory(cats[0]?.id || "task");
-    setPriority("mid");
-    setErrMsg("");
-    setStage("assign");
-  }
-  function save() {
-    if (!title.trim()) {
-      setErrMsg("제목을 입력해주세요.");
-      return;
-    }
-    onAddEntry({
-      category,
-      priority,
-      title: title.trim(),
-      body,
-      date: todayStr(),
-      deadline: "",
-      tags: [],
-      photos: [],
-      attachments: [],
-      done: false
-    });
-    setPasteText("");
-    setTitle("");
-    setBody("");
-    setErrMsg("");
-    setStage("paste");
-    alert("저장되었습니다.");
-  }
-  return /*#__PURE__*/React.createElement("div", {
-    style: {
-      paddingBottom: 20
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "#f0f6fb",
-      border: "1px solid #c5dff5",
-      borderRadius: 10,
-      padding: "14px 16px",
-      marginBottom: 18,
-      fontSize: 13,
-      color: "#1a4a6e",
-      lineHeight: 1.8
-    }
-  }, /*#__PURE__*/React.createElement("div", {
-    style: {
-      fontWeight: 700,
-      marginBottom: 4
-    }
-  }, "\uD83D\uDCCB \uC218\uCCA9 \uB0B4\uC6A9 \uBE60\uB974\uAC8C \uC785\uB825"), /*#__PURE__*/React.createElement("div", null, "\u2460 \uC218\uCCA9 \uC0AC\uC9C4\uC744 Claude \uCC44\uD305\uCC3D\uC5D0 \uBCF4\uB0B4\uBA74 \uD14D\uC2A4\uD2B8\uB97C \uCD94\uCD9C\uD574\uB4DC\uB9BD\uB2C8\uB2E4"), /*#__PURE__*/React.createElement("div", null, "\u2461 \uCD94\uCD9C\uB41C \uD14D\uC2A4\uD2B8\uB97C \uC544\uB798\uC5D0 \uBD99\uC5EC\uB123\uAE30"), /*#__PURE__*/React.createElement("div", null, "\u2462 \uCCAB \uC904\uC740 \uC81C\uBAA9, \uB098\uBA38\uC9C0\uB294 \uB0B4\uC6A9\uC73C\uB85C \uC790\uB3D9 \uBD84\uB9AC")), errMsg && /*#__PURE__*/React.createElement("div", {
-    style: {
-      background: "#fdf2f2",
-      border: "1px solid #f5c6c6",
-      borderRadius: 8,
-      padding: "10px 14px",
-      marginBottom: 14,
-      fontSize: 13,
-      color: "#c0392b"
-    }
-  }, "⚠️ " + errMsg), stage === "paste" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement("textarea", {
-    value: pasteText,
-    onChange: e => setPasteText(e.target.value),
-    placeholder: "텍스트를 붙여넣으세요.\n첫 줄 → 제목 / 나머지 줄 → 내용으로 자동 분리됩니다.",
-    rows: 9,
-    style: {
-      width: "100%",
-      padding: "14px",
-      border: "1px solid #ddd",
-      borderRadius: 10,
-      fontSize: 14,
-      boxSizing: "border-box",
-      fontFamily: "inherit",
-      resize: "vertical",
-      lineHeight: 1.8,
-      color: "#222"
-    }
-  }), /*#__PURE__*/React.createElement("button", {
-    onClick: applyPaste,
-    disabled: !pasteText.trim(),
-    style: {
-      display: "block",
-      width: "100%",
-      marginTop: 12,
-      padding: "14px",
-      background: pasteText.trim() ? "#1a1a2e" : "#ccc",
-      color: "#fff",
-      border: "none",
-      borderRadius: 10,
-      fontSize: 15,
-      fontWeight: 700,
-      cursor: pasteText.trim() ? "pointer" : "not-allowed"
-    }
-  }, "\u2192 \uBD84\uB958 \uC120\uD0DD")), stage === "assign" && /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC81C\uBAA9 *"), /*#__PURE__*/React.createElement("input", {
-    value: title,
-    onChange: e => setTitle(e.target.value),
-    placeholder: "\uC81C\uBAA9",
-    style: {
-      width: "100%",
-      padding: "11px 10px",
-      border: "1px solid #ddd",
-      borderRadius: 8,
-      fontSize: 15,
-      boxSizing: "border-box",
-      marginBottom: 12
-    }
-  }), /*#__PURE__*/React.createElement(Lbl, null, "\uB0B4\uC6A9"), /*#__PURE__*/React.createElement("textarea", {
-    ref: bodyRef2,
-    value: body,
-    onChange: e => {
-      setBody(e.target.value);
-      autoResize2(e.target);
-    },
-    placeholder: "\uB0B4\uC6A9 (\uC120\uD0DD)",
-    rows: 5,
-    style: {
-      width: "100%",
-      padding: "10px",
-      border: "1px solid #ddd",
-      borderRadius: 8,
-      fontSize: 14,
-      boxSizing: "border-box",
-      fontFamily: "inherit",
-      resize: "none",
-      lineHeight: 1.7,
-      marginBottom: 12,
-      minHeight: 100,
-      overflow: "hidden"
-    }
-  }), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "grid",
-      gridTemplateColumns: "1fr 1fr",
-      gap: 10,
-      marginBottom: 18
-    }
-  }, /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uBD84\uB958"), /*#__PURE__*/React.createElement(MobSelect, {
-    value: category,
-    onChange: setCategory
-  }, cats.map(c => /*#__PURE__*/React.createElement("option", {
-    key: c.id,
-    value: c.id
-  }, c.icon, " ", c.label)))), /*#__PURE__*/React.createElement("div", null, /*#__PURE__*/React.createElement(Lbl, null, "\uC6B0\uC120\uC21C\uC704"), /*#__PURE__*/React.createElement(MobSelect, {
-    value: priority,
-    onChange: setPriority
-  }, PRIS.map(p => /*#__PURE__*/React.createElement("option", {
-    key: p.id,
-    value: p.id
-  }, p.label))))), /*#__PURE__*/React.createElement("div", {
-    style: {
-      display: "flex",
-      gap: 10
-    }
-  }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      setStage("paste");
-      setErrMsg("");
-    },
-    style: {
-      padding: "13px 18px",
-      border: "1px solid #ddd",
-      borderRadius: 10,
-      background: "#fff",
-      fontSize: 15,
-      cursor: "pointer",
-      color: "#555"
-    }
-  }, "\u2190 \uC218\uC815"), /*#__PURE__*/React.createElement("button", {
-    onClick: save,
-    style: {
-      flex: 1,
-      padding: "13px",
-      border: "none",
-      borderRadius: 10,
-      background: "#27ae60",
-      color: "#fff",
-      fontSize: 15,
-      fontWeight: 700,
-      cursor: "pointer"
-    }
-  }, "\u2705 \uC800\uC7A5"))));
 }
 
 // ══════════════════════════════════════════════════════════
@@ -4406,7 +4196,7 @@ function App({
   const [entries, setEntries] = useState([]);
   const [cats, setCats] = useState(DEFAULT_CATS);
   const [contacts, setContacts] = useState([]);
-  const [tab, setTab] = useState("list"); // list|date|tag|paste|contact
+  const [tab, setTab] = useState("list"); // list|date|tag|contact
   const [calendarVisit, setCalendarVisit] = useState(0);
   const [catFilter, setCatFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -4705,17 +4495,6 @@ function App({
       done: !e.done,
       updatedAt: Date.now()
     } : e));
-  }
-  function addEntry(form) {
-    localDirtyRef.current = true;
-    const now = Date.now();
-    setEntries(p => [{
-      ...form,
-      id: uid(),
-      createdAt: now,
-      updatedAt: now,
-      deletedAt: 0
-    }, ...p]);
   }
 
   // ── 선택 ─────────────────────────────────────────────
@@ -5291,13 +5070,7 @@ function App({
       fontWeight: 700,
       color: "#1a1a2e"
     }
-  }, "\uD83C\uDFF7\uFE0F \uD0DC\uADF8\uBCC4"), tab === "paste" && /*#__PURE__*/React.createElement("span", {
-    style: {
-      fontSize: 13,
-      fontWeight: 700,
-      color: "#1a1a2e"
-    }
-  }, "\u270F\uFE0F \uD14D\uC2A4\uD2B8 \uC785\uB825"), tab === "contact" && /*#__PURE__*/React.createElement("span", {
+  }, "\uD83C\uDFF7\uFE0F \uD0DC\uADF8\uBCC4"), tab === "contact" && /*#__PURE__*/React.createElement("span", {
     style: {
       fontSize: 13,
       fontWeight: 700,
@@ -5418,14 +5191,11 @@ function App({
     onEdit: openEdit,
     onDelete: deleteEntry,
     onToggle: toggleDone
-  }), tab === "paste" && /*#__PURE__*/React.createElement(PasteTab, {
-    cats: cats,
-    onAddEntry: addEntry
   }), tab === "contact" && /*#__PURE__*/React.createElement(ContactTab, {
     contacts: liveContacts,
     onSave: saveContacts,
     onForceSave: forceSaveContacts
-  })), tab !== "paste" && tab !== "contact" && /*#__PURE__*/React.createElement("button", {
+  })), tab !== "contact" && /*#__PURE__*/React.createElement("button", {
     onClick: openNew,
     style: {
       position: "fixed",
