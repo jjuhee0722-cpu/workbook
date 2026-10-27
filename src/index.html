@@ -593,9 +593,7 @@ function Card({entry,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
     <div style={{background:selected?"#eef4ff":entry.done?"#f7f7f5":"#fff",border:"1px solid "+(selected?"#2980b9":entry.done?"#e5e5e0":"#ddd"),borderLeft:"4px solid "+(selected?"#2980b9":entry.done?"#bbb":cat.color),borderRadius:10,padding:"12px 14px",display:"flex",alignItems:"flex-start",gap:10,transition:"background 0.15s"}}>
 
       {/* 선택 체크박스 */}
-      <div onClick={()=>onSelect(entry.id)} style={{marginTop:3,flexShrink:0,width:22,height:22,borderRadius:6,border:"2px solid "+(selected?"#2980b9":entry.done?"#27ae60":"#ccc"),background:selected?"#2980b9":entry.done?"#27ae60":"#fff",cursor:"pointer",display:"flex",alignItems:"center",justifyContent:"center"}}>
-        {(selected||entry.done)&&<span style={{color:"#fff",fontSize:13,fontWeight:700}}>{selected?"✓":entry.done?"✓":""}</span>}
-      </div>
+      <input type="checkbox" aria-label={`${entry.title} 선택`} checked={selected} onChange={()=>onSelect(entry.id)} style={{marginTop:3,flexShrink:0,width:22,height:22,accentColor:"#2980b9",cursor:"pointer"}}/>
 
       <div style={{flex:1,minWidth:0}}>
         <div style={{display:"flex",alignItems:"center",gap:5,flexWrap:"wrap",marginBottom:5}}>
@@ -622,7 +620,7 @@ function Card({entry,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
       </div>
 
       <div style={{display:"flex",flexDirection:"column",gap:4,flexShrink:0}}>
-        <button onClick={()=>onToggle(entry.id)} style={{padding:"5px 8px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444",minWidth:44}}>{entry.done?"↩":"완료"}</button>
+        <button onClick={()=>onToggle(entry.id)} aria-label={entry.done?"미완료로 되돌리기":"업무 완료 처리"} style={{padding:"5px 8px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:entry.done?"#888":"#16854b",minWidth:44}}>{entry.done?"↩ 미완료로":"✓ 완료"}</button>
         <button onClick={()=>onEdit(entry)} style={{padding:"5px 8px",border:"1px solid #ddd",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#444",minWidth:44}}>수정</button>
         <button onClick={()=>onDelete(entry.id)} style={{padding:"5px 8px",border:"1px solid #fcc",borderRadius:6,background:"#fff",fontSize:11,cursor:"pointer",color:"#c0392b",minWidth:44}}>삭제</button>
       </div>
@@ -664,10 +662,10 @@ function SelectionBar({selected,entries,cats,onClear,onMarkDone,onMarkUndone,onD
       </div>
       {/* 액션 */}
       <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-        {undoneCount>0&&<button onClick={onMarkDone}   style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#27ae60",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>✓ 완료({undoneCount})</button>}
-        {doneCount>0  &&<button onClick={onMarkUndone} style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#e67e22",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>↩ 미완료({doneCount})</button>}
+        <button disabled={!undoneCount} onClick={onMarkDone} style={{padding:"8px 12px",border:"none",borderRadius:7,background:undoneCount?"#16854b":"#59625e",color:"#fff",fontSize:12,fontWeight:700,cursor:undoneCount?"pointer":"default"}}>{undoneCount?`✓ 선택한 업무 완료 (${undoneCount})`:"✓ 이미 완료됨"}</button>
+        {doneCount>0&&<button onClick={onMarkUndone} style={{padding:"8px 12px",border:"none",borderRadius:7,background:"#e67e22",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>↩ 미완료로 되돌리기 ({doneCount})</button>}
         <button onClick={()=>{if(window.confirm(selected.size+"개를 삭제하시겠습니까?"))onDelete();}} style={{padding:"6px 12px",border:"none",borderRadius:7,background:"#c0392b",color:"#fff",fontSize:12,fontWeight:700,cursor:"pointer"}}>🗑 삭제({selected.size})</button>
-        <button onClick={onClear} style={{padding:"6px 10px",border:"1px solid rgba(255,255,255,0.3)",borderRadius:7,background:"transparent",color:"#ccc",fontSize:12,cursor:"pointer"}}>해제</button>
+        <button onClick={onClear} style={{padding:"6px 10px",border:"1px solid rgba(255,255,255,0.3)",borderRadius:7,background:"transparent",color:"#ccc",fontSize:12,cursor:"pointer"}}>선택 해제</button>
       </div>
     </div>
   );
@@ -1207,8 +1205,8 @@ function ContactForm({initial,onSubmit,onCancel}) {
 // ══════════════════════════════════════════════════════════
 //  날짜별 / 태그별 / 텍스트 입력 탭
 // ══════════════════════════════════════════════════════════
-function DateView({entries,cats,onEdit}) {
-  const live=entries.filter(e=>!e.done&&e.date);
+function DateView({entries,cats,onEdit,statusLabel="미완료"}) {
+  const live=entries.filter(e=>e.date);
   const [year,setYear]=useState(()=>new Date().getFullYear());
   const [selectedDate,setSelectedDate]=useState(todayStr());
   const [showDetails,setShowDetails]=useState(true);
@@ -1257,7 +1255,7 @@ function DateView({entries,cats,onEdit}) {
           <button onClick={()=>setYear(y=>y-1)} style={{border:"none",background:"#f5f5f5",borderRadius:10,width:38,height:34,fontSize:18,cursor:"pointer",color:"#555"}}>‹</button>
           <div style={{textAlign:"center"}}>
             <div style={{fontSize:22,fontWeight:900,color:"#1a1a2e",letterSpacing:-0.5}}>{year}</div>
-            <div style={{fontSize:11,color:"#999",marginTop:2}}>작성 날짜 기준 · 미완료 항목</div>
+            <div style={{fontSize:11,color:"#999",marginTop:2}}>작성 날짜 기준 · {statusLabel} 항목</div>
           </div>
           <button onClick={()=>setYear(y=>y+1)} style={{border:"none",background:"#f5f5f5",borderRadius:10,width:38,height:34,fontSize:18,cursor:"pointer",color:"#555"}}>›</button>
         </div>
@@ -1313,12 +1311,12 @@ function DateView({entries,cats,onEdit}) {
                 <button key={e.id} onClick={()=>onEdit(e)} style={{display:"flex",alignItems:"center",gap:8,textAlign:"left",border:"1px solid #eee",borderRadius:10,background:"#fafafa",padding:"9px 10px",cursor:"pointer"}}>
                   <span style={{width:9,height:9,borderRadius:"50%",background:cat.color,flexShrink:0}}/>
                   <span style={{fontSize:11,color:cat.color,fontWeight:800,whiteSpace:"nowrap"}}>{cat.label}</span>
-                  <span style={{fontSize:13,color:"#1a1a2e",fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.title||"(제목 없음)"}</span>
+                  <span style={{fontSize:13,color:"#1a1a2e",fontWeight:700,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{e.done?"✓ ":""}{e.title||"(제목 없음)"}</span>
                 </button>
               );
             })}
           </div>
-        ):<div style={{fontSize:12,color:"#aaa",padding:"4px 0"}}>이 날짜에 작성된 미완료 항목이 없습니다.</div>}
+        ):<div style={{fontSize:12,color:"#aaa",padding:"4px 0"}}>이 날짜에 작성된 {statusLabel} 항목이 없습니다.</div>}
       </div>}
     </div>
   );
@@ -1327,7 +1325,7 @@ function DateView({entries,cats,onEdit}) {
 function TagView({entries,cats,selected,onSelect,onEdit,onDelete,onToggle}) {
   const [activeTag,setActiveTag]=useState(null);
   const tagMap={};
-  entries.filter(e=>!e.done).forEach(e=>(e.tags||[]).forEach(t=>{if(!tagMap[t])tagMap[t]=[];tagMap[t].push(e);}));
+  entries.forEach(e=>(e.tags||[]).forEach(t=>{if(!tagMap[t])tagMap[t]=[];tagMap[t].push(e);}));
   const tags=Object.keys(tagMap).sort();
   if(!tags.length) return <Empty text="태그가 없습니다."/>;
   return (<div><div style={{display:"flex",flexWrap:"wrap",gap:7,marginBottom:18}}>{tags.map(t=><TagChip key={t} tag={t+" ("+tagMap[t].length+")"} active={activeTag===t} onClick={()=>setActiveTag(activeTag===t?null:t)}/>)}</div>{activeTag&&(<div><div style={{fontSize:12,fontWeight:700,color:"#555",marginBottom:8}}>{"#"+activeTag+" — "+(tagMap[activeTag]||[]).length+"건"}</div><div style={{display:"flex",flexDirection:"column",gap:8}}>{(tagMap[activeTag]||[]).map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={onSelect} onEdit={onEdit} onDelete={onDelete} onToggle={onToggle}/>)}</div></div>)}</div>);
@@ -1745,7 +1743,7 @@ function App({user}) {
   const [calendarVisit,setCalendarVisit]=useState(0);
   const [catFilter,  setCatFilter]  = useState("all");
   const [search,     setSearch]     = useState("");
-  const [showDone,   setShowDone]   = useState(false);
+  const [statusFilter,setStatusFilter]=useState("active");
   const [sortBy,     setSortBy]     = useState("priority");
   const [modal,      setModal]      = useState(null);
   const [showSidebar,setShowSidebar]= useState(false);
@@ -2064,8 +2062,12 @@ function App({user}) {
   cats.forEach(c=>{counts[c.id]=liveEntries.filter(e=>e.category===c.id&&!e.done).length;});
   const totalActive=liveEntries.filter(e=>!e.done).length;
 
-  const filtered=liveEntries.filter(e=>{
-    if(!showDone&&e.done) return false;
+  const statusLabel={active:"미완료",done:"완료",all:"전체"}[statusFilter];
+  const statusEntries=liveEntries.filter(e=>statusFilter==="all"||(statusFilter==="done"?!!e.done:!e.done));
+  const filterScope=tab==="list"?liveEntries.filter(e=>catFilter==="all"||e.category===catFilter):liveEntries;
+  const statusCounts={active:filterScope.filter(e=>!e.done).length,done:filterScope.filter(e=>e.done).length,all:filterScope.length};
+  function changeStatusFilter(value){setStatusFilter(value);setSelected(new Set());}
+  const filtered=statusEntries.filter(e=>{
     if(catFilter!=="all"&&e.category!==catFilter) return false;
     if(search){const q=search.toLowerCase();return e.title.toLowerCase().includes(q)||(e.body||"").toLowerCase().includes(q)||(e.tags||[]).some(t=>t.toLowerCase().includes(q));}
     return true;
@@ -2170,9 +2172,7 @@ function App({user}) {
                 {storageGet(LS, PW_KEY)?'🔑 비밀번호 변경':'🔒 비밀번호 설정'}
               </button>
               <button onClick={()=>{setShowDiag(true);setShowSidebar(false);}} style={{width:"100%",padding:"10px",border:"1px dashed #b8d8ff",borderRadius:8,background:"#f7fbff",fontSize:13,cursor:"pointer",color:"#2980b9",fontWeight:700}}>🩺 동기화 진단</button>
-              <label style={{display:"flex",alignItems:"center",gap:8,fontSize:13,color:"#666",cursor:"pointer"}}>
-                <input type="checkbox" checked={showDone} onChange={e=>setShowDone(e.target.checked)} style={{accentColor:"#27ae60",width:16,height:16}}/>완료 항목 보기
-              </label>
+              <button onClick={()=>{changeStatusFilter("done");setTab("list");setShowSidebar(false);}} style={{padding:10,border:"1px solid #ddd",borderRadius:8,background:"#fff",color:"#16854b",cursor:"pointer"}}>✓ 완료한 업무 보기</button>
             </div>
           </div>
         </div>
@@ -2195,6 +2195,9 @@ function App({user}) {
 
       {/* 콘텐츠 */}
       <div style={{padding:"14px 14px 80px",maxWidth:700,margin:"0 auto"}}>
+        {["list","date","tag"].includes(tab)&&<div role="group" aria-label="업무 상태 필터" style={{display:"flex",gap:6,marginBottom:14,padding:5,background:"#e6e6e1",borderRadius:12}}>
+          {[["active","미완료"],["done","완료"],["all","전체"]].map(([value,label])=><button key={value} aria-pressed={statusFilter===value} onClick={()=>changeStatusFilter(value)} style={{flex:1,padding:"11px 6px",border:"none",borderRadius:9,background:statusFilter===value?"#fff":"transparent",color:statusFilter===value?(value==="done"?"#16854b":"#1a1a2e"):"#777",fontSize:13,fontWeight:700,boxShadow:statusFilter===value?"0 1px 4px #0001":"none",cursor:"pointer"}}>{label} ({statusCounts[value]})</button>)}
+        </div>}
         {tab==="list"&&(
           <div style={{display:"flex",gap:8,marginBottom:12}}>
             <div style={{flex:1,position:"relative"}}>
@@ -2209,9 +2212,9 @@ function App({user}) {
           </div>
         )}
 
-        {tab==="list"&&(filtered.length===0?<Empty/>:<div style={{display:"flex",flexDirection:"column",gap:8}}>{filtered.map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>)}</div>)}
-        {tab==="date"   &&<DateView key={calendarVisit} entries={liveEntries} cats={cats} onEdit={openEdit}/>}
-        {tab==="tag"    &&<TagView  entries={liveEntries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>} 
+        {tab==="list"&&(filtered.length===0?<Empty text={search?"검색 결과가 없습니다.":`${statusLabel} 업무가 없습니다.`}/>:<div style={{display:"flex",flexDirection:"column",gap:8}}>{filtered.map(e=><Card key={e.id} entry={e} cats={cats} selected={selected.has(e.id)} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>)}</div>)}
+        {tab==="date"   &&<DateView key={calendarVisit} entries={statusEntries} statusLabel={statusLabel} cats={cats} onEdit={openEdit}/>}
+        {tab==="tag"    &&<TagView  entries={statusEntries} cats={cats} selected={selected} onSelect={toggleSelect} onEdit={openEdit} onDelete={deleteEntry} onToggle={toggleDone}/>}
         {tab==="paste"  &&<PasteTab cats={cats} onAddEntry={addEntry}/>}
         {tab==="contact"&&<ContactTab contacts={liveContacts} onSave={saveContacts} onForceSave={forceSaveContacts}/>} 
       </div>
